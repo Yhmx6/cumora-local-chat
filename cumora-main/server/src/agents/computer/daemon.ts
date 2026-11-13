@@ -1,0 +1,5212 @@
+/**
+ * `cumora agent computer` — the BYOA daemon.
+ *
+ * A long-running process on the user's machine (laptop or VPS) that hosts one
+ * or more of their Cumora agents, using a local engine (Claude Code / Codex / pi /
+ * Grok Build / Cursor Agent / OpenCode / Gemini / Qwen / Antigravity) as each
+ * agent's brain. See docs/BYOA.md.
+ *
+ * It talks to the Cumora server only over HTTP — no DB/Redis — so it can run
+ * anywhere:
+ *   - pair once:   cumora agent computer --pair <code> [--server <url>]
+ *   - then run:    cumora agent computer [--server <url>]
+ *
+ * Per managed agent it: mints a short-lived runtime JWT, holds a wake-stream
+ * SSE connection, and on each wake runs the engine in the agent's dedicated
+ * home (~/.cumora/agents/<id>/). Secure adapters impose the host boundary;
+ * a fixed MCP bridge sends file-IPC requests that the daemon forwards to Cumora.
+ *
+ * Standalone: only Node builtins + the DB-free SSE parser + engine.ts.
+ */
+
+import { execFile, spawn } from 'node:child_process'
+import { createHash, randomUUID } from 'node:crypto'
+import { existsSync, constants as FS_CONSTANTS, type FSWatcher, watch } from 'node:fs'
+import { chmod, copyFile, lstat, mkdir, open, readdir, readFile, rename, rm, stat, truncate, writeFile } from 'node:fs/promises'
+import { homedir, hostname } from 'node:os'
+import { delimiter, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
+import { promisify } from 'node:util'
+
+const execFileP = promisify(execFile)
+
+import { type TokenUsage, usageFromClaude } from '../cost.js'
+import { GLANCE_YIELD_RULES } from '../glance-protocol.js'
+import { DISCUSSION_STYLE_RULES } from '../discussion-style.js'
+import { videoMessageReferences, videoContextBlock } from '../../../../shared/video-links.js'
+import {
+  composeMemoryDigest,
+  conversationHeader,
+  memoryIndexPathsForScope,
+  uniqueProjectIds,
+} from '../memory-scope.js'
+import { parseSseStream, wakeStreamWasStable } from '../runtime/sse-parse.js'
+import { type ProviderProfile, providerProfileEnv, providerProfileFingerprint, providerProfileMetadata, readProviderProfiles, redactProviderSecret } from './provider-profiles.js'
+import { modelIdOrNull } from './model-id.js'
+import { parseComputerControlEvent } from './control-event.js'
+import { runEngineUpdate } from './cli-version.js'
+import {
+  mergeWakeBackgroundBriefs,
+  parseWakeData,
+  type WakeBackgroundBrief,
+  wakeHasActionableInput,
+} from '../runtime/wake-options.js'
+import { SKYPE_EMOTICONS_GUIDE } from '../skype-emoticons.js'
+import { finalizeTriage, isRateLimited, parseTriage } from '../triage-core.js'
+import { type ActionSurface, actionSurfaceFor, actionSurfaceText, calendarExampleText, postingMechanicsText } from './prompt-surface.js'
+import { allowUnsandboxedByoa, classifyEngineFailure, detectEnginesWithStatus, ENGINE_IDS, engineFailureOf, engineVisionCapability, type DetectedEngineSnapshot, type EngineHopReport, type EngineId, type EngineRunResult, type EngineSession, type EngineUsage, enrichDetectedEngines, evaluateRunnableEngines, getAdapter, loginCodexRuntime, runEngineDoctor, type RunnableEngineEvaluation, snapshotDetectedEngines } from './engine.js'
+import { EngineSessionStore, sessionIdPreview } from './session-store.js'
+import { CODEX_LOGIN_COMMAND, CODEX_MIGRATE_COMMAND, CODEX_SESSION_SCOPE, codexRuntimeHome } from './codex-runtime.js'
+import { cachedCodexProvider } from './codex-provider.js'
+import { migrateCodexSession, migrateCodexSessions } from './codex-session-migration.js'
+import { runWithSessionRecovery } from './session-recovery.js'
+import { normalizeAttachments, type AttachmentDescriptor } from '../../../../shared/attachments.js'
+import { AgentAttachmentCache, attachmentImageGuidance, isImageAttachment, renderCachedAttachments, type AttachmentCacheResult } from './attachment-cache.js'
+
+export { conversationHeader }
+
+/** Serialize engine scans and coalesce duplicate requests. A forced refresh that
+ * arrives during an ordinary scan schedules exactly one follow-up forced report,
+ * so the UI acknowledgement cannot be swallowed by older work. */
+export function createEngineRescanQueue(
+  scan: (forceReport: boolean) => Promise<void>,
+): (forceReport?: boolean) => Promise<void> {
+  let inFlight: Promise<void> | null = null
+  let forcedPending = false
+  return (forceReport = false): Promise<void> => {
+    forcedPending ||= forceReport
+    if (inFlight) return inFlight
+    const running = (async () => {
+      let first = true
+      while (first || forcedPending) {
+        first = false
+        const force = forcedPending
+        forcedPending = false
+        await scan(force)
+      }
+    })().finally(() => {
+      if (inFlight === running) inFlight = null
+    })
+    inFlight = running
+    return running
+  }
+}
+
+const CONFIG_DIR = join(homedir(), '.cumora')
+const CONFIG_PATH = join(CONFIG_DIR, 'computer.json')
+const AGENTS_ROOT = join(CONFIG_DIR, 'agents')
+// Per-agent, per-engine session id, persisted OUTSIDE the agent home (so the engine's
+// own cwd can't clobber it). Survives a daemon restart so the next wake can
+// `--resume` the SAME engine session — recovering the in-turn context an
+// interrupted long task was building, instead of starting cold.
+const SESSIONS_DIR = join(CONFIG_DIR, 'sessions')
+// Bounded grace on a forced shutdown (SIGTERM/SIGINT): let an in-flight turn try
+// to finish before we kill the engine child. The OS supervisor SIGKILLs not long
+// after SIGTERM, so this is best-effort for SHORT turns; long tasks rely on the
+// session-resume above. Self-update (voluntary) doesn't use this — it waits for
+// idle instead (never interrupts work). Override via CUMORA_SHUTDOWN_GRACE_MS.
+const SHUTDOWN_GRACE_MS = Number(process.env.CUMORA_SHUTDOWN_GRACE_MS) || 15_000
+const DEFAULT_SERVER = process.env.CUMORA_SERVER_URL || 'https://api.cumora.ai'
+const TOKEN_REFRESH_SKEW_MS = 5 * 60 * 1000 // refresh 5min before expiry
+const AGENT_POLL_MS = 60_000
+const HEARTBEAT_MS = 30_000
+// How often the daemon re-scans PATH for installed engines. Deliberately much
+// slower than the heartbeat: detection spawns a `which`/`where` per engine, and
+// nobody installs a CLI twice a minute. The heartbeat carries the CACHED result,
+// so the report costs nothing on the 30s tick.
+const ENGINE_RESCAN_MS = 5 * 60 * 1000
+// While an engine turn is in flight, bump the run's updated_at this often so the
+// server's 10-min stale-run sweeper doesn't false-positive a legitimately long
+// turn (a multi-hour Bash, a deep task) as "orphaned". 60s = 10× margin under the
+// 10-min reaper; cheap (one tiny UPDATE). A long task NO LONGER hits a hidden cap.
+const RUN_HEARTBEAT_MS = 60_000
+// Fallback inbox drain. The wake-stream SSE can be silently severed by the
+// network edge (the server writes the wake onto a half-dead socket, counts it
+// delivered, and does nothing more), so a live wake can be lost until the daemon
+// detects the drop and reconnects. This self-drain bounds catch-up latency
+// regardless of SSE health; an empty inbox makes the turn a cheap no-op for the
+// DAEMON — but not for the server: every drain is a loadInbox against Postgres,
+// and at fleet scale (thousands of idle agents × one drain per 20s) that alone
+// pegged Cloud SQL. So the tick stays at 20s, but a tick only drains when the
+// stream is not provably alive (see fallbackPollDue): the server writes a
+// `: ping` comment every 25s (wake-bus.ts), so a stream silent for three pings
+// counts as dead and is polled at the old cadence AND torn down so streamLoop
+// reconnects (a half-dead socket can otherwise sit "open" for many minutes);
+// a stream that is demonstrably alive is trusted and only double-checked every
+// INBOX_POLL_STREAM_HEALTHY_MS.
+const INBOX_POLL_MS = 20_000
+const INBOX_POLL_STREAM_HEALTHY_MS = 120_000
+const WAKE_STREAM_STALE_MS = 75_000
+// Idle-tick `avail` reassert. Every idle drain used to POST /status {avail} —
+// an UPDATE + Redis publish per agent per tick that changed nothing. The server
+// now no-ops an avail→avail write, but the request itself (and its resolveDevice)
+// still costs; so the daemon posts avail only when the last status it sent was
+// something else, and re-asserts it this often as self-healing in case the
+// server-side row drifted (a failed post, a restore from backup, ...).
+const AVAIL_REASSERT_MS = 10 * 60_000
+// Pre-turn wake debounce. The FIRST wake from
+// an idle state arms this timer; wakes arriving within the window FOLD INTO it —
+// the turn snapshots ALL unread, so a burst of group messages becomes ONE big-
+// engine turn instead of N. Content-blind, no classification.
+//
+// 500ms, not 2.5s: this delay sits on the critical path of EVERY reply, and a live
+// chat measurement showed the two waits (2.53s each) costing more perceived
+// latency than the coalescing saved — a room's burst still folds in at 500ms
+// because the timer only starts once the first wake lands.
+const WAKE_DEBOUNCE_MS = 500
+// Same-turn group notice (default ON — set CUMORA_BYOA_STEER_GROUP=0
+// to disable). A DIRECT ping (DM / @me / human) is ALWAYS steered into the live
+// turn (see maybeSteer). With this on, plain GROUP activity arriving while busy
+// ALSO gets a single CONTENT-FREE nudge ("N new message(s) in <convo> — glance
+// and handle if it's yours") injected into the running turn, so the agent can
+// pick it up mid-task instead of only via the post-turn coalesced
+// rerun. The rerun stays as the coordination-safe BACKSTOP: if the agent handles
+// the activity in-turn, the rerun's snapshot finds nothing unread and no-ops; if
+// not, it still runs a clean re-glance turn. Originally shipped default-OFF
+// because mid-turn group handling ran against the turn-START compose-anchor;
+// that anchor is GONE — freshness is now the server-side seen-cursor (HOLD shows
+// newer messages and advances the cursor), which arbitrates a mid-turn reply
+// exactly like a post-wake one — so the coordination-safety objection no longer
+// exists and the busy-room latency win (skip a whole wake→triage→turn cycle per
+// coalesced burst) is taken by default.
+const STEER_GROUP_IN_TURN = process.env.CUMORA_BYOA_STEER_GROUP !== '0'
+// Throttle for the content-free group notice so a fast room can't spam the live
+// session — at most one group nudge per this window (direct pings are unthrottled).
+const GROUP_STEER_MIN_INTERVAL_MS = Math.max(0, Number(process.env.CUMORA_BYOA_STEER_GROUP_INTERVAL_MS ?? 8_000))
+// Per-turn steering BUDGET. The cloud pod's steer queue has caps
+// (MAX_BATCHES_PER_TURN / MAX_BYTES_PER_TURN in ../steer.ts); the BYOA path
+// had none — ClaudeSession.steerQueue is an unbounded array, and a direct ping
+// is unthrottled by design. A long turn in a fast room could therefore inject
+// an unbounded amount of text into one engine session, which costs context on
+// every subsequent hop of that turn. These mirror the cloud numbers where the
+// shape matches; over-budget pings are NOT dropped — they ride the coalesced
+// rerun, exactly like a steer on an engine with no mid-turn channel.
+const MAX_STEERS_PER_TURN = Math.max(0, Number(process.env.CUMORA_BYOA_MAX_STEERS_PER_TURN ?? 8))
+const MAX_STEER_CHARS_PER_TURN = Math.max(0, Number(process.env.CUMORA_BYOA_MAX_STEER_CHARS_PER_TURN ?? 65_536))
+// Body cap for a DIRECT ping's injected text. The old 300 chars truncated
+// ordinary messages mid-sentence, so the agent answered half a question; the
+// cloud path allows 4096 (MAX_BODY_BYTES in ../steer.ts) for the same reason.
+const STEER_BODY_CHARS = 4_000
+
+/** One turn's steering allowance. Pure so the arithmetic is testable without
+ *  booting a runner. A steer that does not fit is refused, not truncated, and
+ *  the message rides the coalesced rerun instead. */
+export interface SteerBudget {
+  steers: number
+  chars: number
+  maxSteers: number
+  maxChars: number
+}
+
+/** True when another steer fits. Callers check BEFORE building the text. */
+export function steerBudgetExhausted(b: SteerBudget): boolean {
+  return b.steers >= b.maxSteers || b.chars >= b.maxChars
+}
+
+/** Account for one injected steer of `chars` characters. */
+export function chargeSteerBudget(b: SteerBudget, chars: number): SteerBudget {
+  return { ...b, steers: b.steers + 1, chars: b.chars + Math.max(0, chars) }
+}
+
+// Board-awareness: when chat is idle, check the agent's AGENDA (assigned Kanban
+// cards + due calendar events) so it PROACTIVELY picks up assigned board work
+// instead of only reacting to a chat push. Gated like the cloud idle scheduler:
+// the agent must have been QUIET (no turn) for AGENDA_QUIET_MS — that quiet window
+// is the anti-loop (after it acts, it isn't re-woken until quiet again) — and we
+// check at most every AGENDA_CHECK_MS so the 20s poll doesn't hammer it.
+// Tightened 3min/2min → 90s/60s: agents have NO wall-clock wakes — a judge who
+// says "vote closes in 2 minutes" and goes idle can only be re-woken by a new
+// message (there may be none: everyone voted), the 20s poll (no-ops once the
+// inbox is acked), or THIS agenda sweep. Measured in werewolf game13: all six
+// votes were in by 13:53:05 and the tally sat until a player prodded the judge
+// at 13:56:53 — a 4-minute dead-air gap bounded exactly by quiet+check. 90/60
+// caps "it's someone's move and nobody speaks" recovery at ~2.5min while the
+// server-side agenda classifier (support-model, Cumora-subsidized — not the
+// operator's quota) stays throttled by these same gates. A real fix is
+// first-class agent reminders; this narrows the gap now.
+const AGENDA_QUIET_MS = 90_000
+const AGENDA_CHECK_MS = 60_000
+const MAX_VISIBLE_ERROR_CHARS = 900
+// Big-brain spawn jitter. When an SSE wake fans out to N agents on this
+// computer at the same instant (e.g. a human @all in a group), N local-engine
+// subprocesses would spawn in the same millisecond and slam Anthropic/OpenAI
+// in lockstep — observed today as four byoa_engine_failed notices in a row
+// with "Server is temporarily limiting requests · Rate limited" right after
+// a counting game kicked off. Sleeping a random 0..MAX before spawning the
+// big brain spreads the burst across ~1.5s so the API sees them sequentially
+// instead of a stampede. Cheap (worst case: ~1.5s added to one wake's
+// latency); the small-brain triage already ran first, so this only delays
+// the *expensive* call we'd otherwise rate-limit-fail.
+// DETERMINISTIC minimum interval between spawn starts (per-computer, applied
+// to BOTH big-brain and triage paths since they share the same Anthropic/
+// OpenAI account quota and the same local CLI process pool). Replaces the
+// earlier RANDOM jitter approach which was probabilistic: with random
+// 0-1500ms jitter, 4 simultaneous wakes could each roll a low value and
+// still hit the provider in lockstep. A deterministic start-interval gate
+// instead ensures each new start begins at least N ms after the previous
+// one — burst rate becomes a hard 2/sec
+// regardless of how many agents woke at once. Anthropic/OpenAI short-window
+// burst limits are well above 2/sec so this eliminates the "Server is
+// temporarily limiting requests" storms entirely without slowing the steady
+// state. Override via CUMORA_BYOA_MIN_SPAWN_INTERVAL_MS.
+const MIN_SPAWN_INTERVAL_MS = Math.max(0, Number(process.env.CUMORA_BYOA_MIN_SPAWN_INTERVAL_MS ?? 500))
+// Per-computer cap on concurrent big-brain spawns. Without this, N agents
+// woken on the same SSE fanout each go to triage + spawn in parallel and
+// all hit the underlying provider (Anthropic/OpenAI) at the same wall-clock
+// window — even with jitter, the user's per-account short-window burst
+// limit is typically smaller than the agent count, so we observed 130
+// "Server is temporarily limiting requests" hits in 17 minutes during a
+// counting game with 7 agents. Serializing through this semaphore makes
+// the daemon respect the provider's burst limit by construction:
+// excess agents queue while the first N are in flight; queue drains naturally
+// as each turn finishes. Trade-off: tail latency for late-queued agents
+// while a turn is being served.
+//
+// DEFAULT 6 (was 2). The 2 was calibrated for the cold-spawn era — every turn
+// spawned a fresh CLI process and N simultaneous spawns slammed the provider.
+// Two things changed: turns now run through PERSISTENT engine sessions
+// (ensureEngineSession — no per-turn process spawn to burst), and actual spawns
+// are paced by the deterministic spawnPacer above. What the old default DID
+// provably cause: in a broadcast room (werewolf, 7 players woken by every group
+// message) the queue ran 6 deep and tail turns waited 215-359s — minutes of
+// user-visible silence purely from queueing. 6 keeps a hard backstop while
+// letting a whole team think in parallel. Override via CUMORA_BYOA_MAX_CONCURRENT_BIG_BRAIN.
+const BIG_BRAIN_CONCURRENCY = Math.max(1, Number(process.env.CUMORA_BYOA_MAX_CONCURRENT_BIG_BRAIN ?? 6))
+// Per-computer cap on concurrent SMALL-brain (triage) spawns. The same
+// thundering-herd problem the big-brain sem fixes: when N agents wake on
+// the same SSE fanout, each spawns its own `claude --model haiku` (or
+// `codex --model gpt-5.4-mini`) for triage. Without a cap the local CLI
+// processes + Anthropic/OpenAI small-model endpoint get hammered and the
+// 30s TRIAGE_TIMEOUT_MS fires for the slower-queued ones, abort sends
+// SIGTERM (exit 143), daemon treats abort as rate-limited and enters a
+// 30s per-agent cooldown — every agent's triage stalls for 30s, no big
+// brain wakes, the whole computer goes silent. Observed today: 4 agents
+// `local triage RATE-LIMITED (timed out) — process exited with code 143`
+// in the same second. Triage is cheaper than big brain so the default sits
+// above BIG_BRAIN_CONCURRENCY. DEFAULT 8 (was 4): a 7-8 agent broadcast wake
+// (werewolf, @all) queued in two waves at 4 — measured as "triage 4983-7772ms"
+// where most of that was queue wait, delaying every turn behind it. 8 lets a
+// full team's gate checks run in one wave; the shared spawnPacer still caps the
+// provider burst rate, and the 143/timeout storm the cap exists for stays
+// prevented. Override via CUMORA_BYOA_MAX_CONCURRENT_TRIAGE.
+const TRIAGE_CONCURRENCY = Math.max(1, Number(process.env.CUMORA_BYOA_MAX_CONCURRENT_TRIAGE ?? 8))
+// After a rate-limit hit on this agent, skip ITS turns for this long before
+// retrying. Without this, a rate-limited agent re-attempts on EVERY poll +
+// SSE wake, each attempt burning a wasted call on the throttled provider
+// — that's where the 130 rate-limit log lines came from. A 60s cooldown
+// lets the provider's short-window limit reset before we try again.
+const ENGINE_BACKOFF_AFTER_RATE_LIMIT_MS = 60_000
+/** Cooldown after an engine failure only the OPERATOR can clear — a signed-out
+ *  CLI, an exhausted credit balance. Far longer than the rate-limit window,
+ *  because retrying changes nothing until a human logs in or tops up.
+ *
+ *  Measured before this existed: nine computers with a signed-out Claude
+ *  produced 1,988 failed turns in forty minutes — about one every twelve
+ *  seconds each, forever, with no backoff and nothing telling their operator
+ *  why. That is most of what a fleet-wide "97% failure rate" actually was. */
+const ENGINE_BACKOFF_AFTER_OPERATOR_FIX_MS = 15 * 60_000
+
+/** Engine failures that will recur identically until a human intervenes.
+ *  Deliberately narrow: only errors whose remedy is unambiguous and whose
+ *  retry has no chance of succeeding. Anything uncertain stays on the normal
+ *  path and keeps retrying. */
+const OPERATOR_FIX_RE = /not logged in|please run \/login|credit balance is too low|insufficient (credit|quota)|invalid api key|unauthorized/i
+
+export function needsOperatorFix(err: string | null | undefined): boolean {
+  return !!err && OPERATOR_FIX_RE.test(err)
+}
+
+/** What a finished engine turn says about trying again, in one place.
+ *
+ *  A turn ends on one of two paths — the chat wake, and the proactive agenda
+ *  heartbeat that fires every AGENDA_CHECK_MS on its own — and both end at this
+ *  same question. They used to answer it differently: the chat path put a
+ *  signed-out engine to sleep for fifteen minutes, and the agenda path did not.
+ *  So an agent nobody happened to be chatting with kept exactly the spin the
+ *  pause exists to stop, one dead spawn a minute, indefinitely.
+ *
+ *  Classifying once is what keeps the two paths honest. A path can still fail to
+ *  ASK — which is one grep away — but it can no longer hold a different opinion
+ *  than the other about what a given failure means.
+ *
+ *  Order matters: a throttle that also mentions quota is a throttle. It clears
+ *  itself, so it takes the short cooldown and stays out of the user's chat. */
+export type TurnOutcome =
+  /** Clean turn — cancel any pause this agent was under. */
+  | 'ok'
+  /** Provider throttle. Clears itself: short cooldown, no user-facing notice. */
+  | 'rate-limited'
+  /** Only a human can clear it. Long pause, and tell someone. */
+  | 'operator-fix'
+  /** Cause unknown. Keep retrying, and leave any existing pause alone. */
+  | 'transient'
+
+export function classifyTurnOutcome(engineError: string | null | undefined): TurnOutcome {
+  if (!engineError) return 'ok'
+  // Preserve normal retries for local startup failures, even when the path
+  // happens to contain provider keywords such as "quota".
+  if (classifyEngineFailure(engineDiagnosticProse(engineError)) === 'startup') return 'transient'
+  if (isRateLimited(engineError)) return 'rate-limited'
+  if (needsOperatorFix(engineError)) return 'operator-fix'
+  return 'transient'
+}
+
+/** The engine backoff deadline a finished turn implies, or null to leave the
+ *  current one untouched. Null is not zero: an unexplained failure must not
+ *  cancel a pause an earlier, well-understood one established. */
+export function backoffUntilFor(outcome: TurnOutcome, now: number): number | null {
+  switch (outcome) {
+    case 'ok': return 0
+    case 'rate-limited': return now + ENGINE_BACKOFF_AFTER_RATE_LIMIT_MS
+    case 'operator-fix': return now + ENGINE_BACKOFF_AFTER_OPERATOR_FIX_MS
+    case 'transient': return null
+  }
+}
+// Neutral cwd for LOCAL small-brain triage: no persona CLAUDE.md / skills / MCP,
+// so the cerebellum completion is fast and tool-free.
+const TRIAGE_DIR = join(CONFIG_DIR, 'triage')
+const TRIAGE_TIMEOUT_MS = 30_000
+
+/** Per-computer concurrency gate for big-brain spawns. acquire() resolves
+ *  immediately if a slot is free; otherwise it queues FIFO and resolves
+ *  when an earlier holder releases. Pure in-process — bounded queue size
+ *  follows the agent count (~7 typical), no memory concern. */
+class BigBrainSemaphore {
+  private inFlight = 0
+  private readonly waiters: Array<() => void> = []
+  constructor(private readonly max: number) {}
+  async acquire(): Promise<void> {
+    if (this.inFlight < this.max) {
+      this.inFlight += 1
+      return
+    }
+    await new Promise<void>((resolve) => this.waiters.push(resolve))
+    this.inFlight += 1
+  }
+  release(): void {
+    this.inFlight -= 1
+    const next = this.waiters.shift()
+    if (next) next()
+  }
+  /** Diagnostic only — number of waiters currently queued. */
+  get queueDepth(): number { return this.waiters.length }
+}
+const bigBrainSem = new BigBrainSemaphore(BIG_BRAIN_CONCURRENCY)
+const triageSem = new BigBrainSemaphore(TRIAGE_CONCURRENCY)
+
+/** Per-computer ADAPTIVE minimum interval between local-CLI spawns.
+ *  Deterministic spacing (see MIN_SPAWN_INTERVAL_MS above) that
+ *  auto-tunes to the user's actual Anthropic/OpenAI burst quota: starts
+ *  at MIN_SPAWN_INTERVAL_MS (default 500ms), doubles on every
+ *  rate-limit event (signaled via `onRateLimited()`), capped at 8s.
+ *  After CONSECUTIVE_OK_BEFORE_HALVE (5) successive successes (signaled
+ *  via `onOk()`), halves back toward the base — so a transient burst
+ *  spike doesn't permanently slow steady-state throughput. This lets one
+ *  daemon binary work across very different account tiers without env
+ *  tuning, and converges to the user's actual quota in a minute or two
+ *  of natural traffic. */
+class AdaptivePacer {
+  private next = 0
+  private current: number
+  private consecutiveOk = 0
+  constructor(private readonly base: number, private readonly maxMs = 8000) {
+    this.current = base
+  }
+  async gate(): Promise<void> {
+    if (this.current <= 0) return
+    const now = Date.now()
+    const earliest = Math.max(now, this.next)
+    this.next = earliest + this.current
+    const wait = earliest - now
+    if (wait > 0) await new Promise((r) => setTimeout(r, wait))
+  }
+  /** Called when a spawn after gate() ends up rate-limited. Doubles the
+   *  interval (capped) and resets the success streak so we don't halve
+   *  back too fast on the next OK. */
+  onRateLimited(): void {
+    const prev = this.current
+    this.current = Math.min(this.maxMs, Math.max(this.base, this.current * 2))
+    this.consecutiveOk = 0
+    if (this.current !== prev) {
+      console.warn(`[pacer] adapt: ${prev}ms → ${this.current}ms (rate-limited; cap ${this.maxMs}ms)`)
+    }
+  }
+  /** Called when a spawn completes cleanly (no rate-limit). After enough
+   *  in a row, decay back toward the base. */
+  onOk(): void {
+    if (this.current === this.base) return
+    this.consecutiveOk += 1
+    if (this.consecutiveOk >= 5) {
+      const prev = this.current
+      this.current = Math.max(this.base, Math.floor(this.current / 2))
+      this.consecutiveOk = 0
+      if (this.current !== prev) {
+        console.log(`[pacer] adapt: ${prev}ms → ${this.current}ms (5 ok; decaying toward base ${this.base}ms)`)
+      }
+    }
+  }
+  get intervalMs(): number { return this.current }
+}
+const spawnPacer = new AdaptivePacer(MIN_SPAWN_INTERVAL_MS)
+
+// ─── self-update ──────────────────────────────────────────────────────────
+// Injected by esbuild at build time (agent-cli/build.mjs). Source-mode
+// launchers may provide CUMORA_VERSION; otherwise development falls back to
+// 0.0.0. The typeof guard keeps an undefined build constant safe at runtime.
+declare const __CUMORA_VERSION__: string | undefined
+export function resolveCurrentVersion(bundledVersion: string | undefined, envVersion = process.env.CUMORA_VERSION): string {
+  return bundledVersion ?? (envVersion?.trim() || '0.0.0')
+}
+const CURRENT_VERSION = resolveCurrentVersion(
+  typeof __CUMORA_VERSION__ === 'string' ? __CUMORA_VERSION__ : undefined,
+)
+const UPDATE_CHECK_MS = 6 * 60 * 60 * 1000 // re-check npm every 6h
+// Log rotation: the service supervisor (launchd StandardOutPath / systemd) writes
+// the daemon's stdout to ~/.cumora/daemon.log and NEVER rotates it — left alone it
+// fills the user's disk. We cap it ourselves.
+const MAX_LOG_BYTES = 20 * 1024 * 1024 // rotate when the live log passes 20MB
+const LOG_ROTATE_MS = 5 * 60 * 1000 // check every 5 minutes
+const SERVICE_LABEL = 'io.cumora.daemon'
+/** The supervisor (`--install-service`) sets this so the daemon knows a clean
+ *  exit will be auto-restarted on `cumora@latest` — only then do we self-exit
+ *  to apply an update. A manually-run daemon just logs the available version. */
+const SUPERVISED = process.env.CUMORA_SUPERVISED === '1'
+
+export function windowsTaskName(home = homedir()): string {
+  const userKey = createHash('sha256').update(home.toLowerCase()).digest('hex').slice(0, 12)
+  return `Cumora BYOA Daemon (${userKey})`
+}
+
+/** semver-ish a > b for plain MAJOR.MINOR.PATCH (ignores pre-release tags). */
+function versionGt(a: string, b: string): boolean {
+  const pa = a.split('.').map((n) => parseInt(n, 10) || 0)
+  const pb = b.split('.').map((n) => parseInt(n, 10) || 0)
+  for (let i = 0; i < 3; i++) {
+    if ((pa[i] ?? 0) > (pb[i] ?? 0)) return true
+    if ((pa[i] ?? 0) < (pb[i] ?? 0)) return false
+  }
+  return false
+}
+
+interface DaemonConfig {
+  serverUrl: string
+  computerId: string
+  deviceToken: string
+  /** Persisted host-wide compatibility mode; absent means secure default. */
+  unsandboxed?: boolean
+}
+
+interface AgentInfo {
+  providerProfile?: string | null
+  id: string
+  name: string
+  role: string | null
+  systemPrompt: string | null
+  engine: EngineId | null
+  model: string | null
+  fastModel: string | null
+  nativeFastMode?: boolean
+  modelCatalog?: {
+    models: Array<{ id: string; label: string; vision?: 'supported' | 'unsupported' | 'unknown' }>
+    defaultModel: string | null
+  }
+}
+
+/** Render one attachment descriptor in the inbox digest. The daemon separately
+ *  downloads authorized bytes into the Agent home. */
+export function attachmentNote(
+  att: { name?: string; kind?: string; mime?: string; size?: number; url?: string } | null | undefined,
+): string {
+  if (!att || typeof att !== 'object') return ''
+  const name = typeof att.name === 'string' && att.name.trim() ? att.name.trim().slice(0, 120) : 'file'
+  const type = typeof att.mime === 'string' && att.mime.trim()
+    ? att.mime.trim().slice(0, 60)
+    : (typeof att.kind === 'string' ? att.kind.slice(0, 20) : '')
+  const size = typeof att.size === 'number' && Number.isFinite(att.size) && att.size > 0
+    ? ` ${att.size >= 1024 * 1024 ? `${(att.size / 1024 / 1024).toFixed(1)}MB` : `${Math.max(1, Math.round(att.size / 1024))}KB`}`
+    : ''
+  const url = typeof att.url === 'string' && /^https?:\/\//.test(att.url) ? ` ${att.url}` : ''
+  return `  [attachment: ${name}${type ? ` · ${type}` : ''}${size}${url}]`
+}
+
+/** Render every descriptor in canonical order. The singular helper remains for
+ *  legacy callers and tests; the digest always goes through this list boundary. */
+export function attachmentNotes(value: unknown): string {
+  return normalizeAttachments(value).map((attachment) => attachmentNote({
+    name: attachment.name,
+    kind: attachment.kind,
+    mime: attachment.mime,
+    size: attachment.size,
+  })).join('')
+}
+
+interface RuntimeCliAttachmentRead {
+  messageId: string
+  attachments: AttachmentDescriptor[]
+}
+
+function runtimeCliAttachmentReads(value: unknown): RuntimeCliAttachmentRead[] {
+  if (!Array.isArray(value)) return []
+  const reads: RuntimeCliAttachmentRead[] = []
+  for (const candidate of value.slice(0, 200)) {
+    if (!candidate || typeof candidate !== 'object') continue
+    const record = candidate as Record<string, unknown>
+    if (typeof record.messageId !== 'string' || !record.messageId) continue
+    const attachments = normalizeAttachments(record.attachments)
+    if (attachments.length > 0) reads.push({ messageId: record.messageId, attachments: [...attachments] })
+  }
+  return reads
+}
+
+/** Add the local path to each attachment object inside the CLI's JSON result.
+ *  JSON output stays valid instead of receiving a trailing prose block. */
+export function enrichCliJsonWithAttachmentPaths(
+  text: string,
+  cachedByMessage: ReadonlyMap<string, AttachmentCacheResult>,
+  vision: 'supported' | 'unsupported' | 'unknown',
+): string | null {
+  let value: unknown
+  try { value = JSON.parse(text) } catch { return null }
+  const visit = (node: unknown): void => {
+    if (!node || typeof node !== 'object') return
+    if (Array.isArray(node)) {
+      for (const item of node) visit(item)
+      return
+    }
+    const record = node as Record<string, unknown>
+    const messageId = typeof record.id === 'string' ? record.id : null
+    const cached = messageId ? cachedByMessage.get(messageId) : undefined
+    if (cached) {
+      for (const field of ['attachments', 'attachment'] as const) {
+        const raw = record[field]
+        const list = Array.isArray(raw) ? raw : raw && typeof raw === 'object' ? [raw] : []
+        for (const attachment of list) {
+          if (!attachment || typeof attachment !== 'object') continue
+          const descriptor = attachment as Record<string, unknown>
+          const key = typeof descriptor.key === 'string' ? descriptor.key : null
+          const file = cached.files.find((candidate) => candidate.attachment.key === key)
+          if (file) {
+            descriptor.localPath = file.path
+            if (file.attachment.kind === 'img' || file.attachment.mime?.startsWith('image/') === true) {
+              descriptor.localImageGuidance = attachmentImageGuidance(vision)
+            }
+            if (file.text !== undefined) {
+              descriptor.localText = file.text
+              descriptor.localTextTruncated = file.textTruncated === true
+            }
+          } else {
+            const failure = cached.failures.find((candidate) => candidate.key === key)
+              ?? cached.failures.find((candidate) => !candidate.key && candidate.name === descriptor.name)
+            if (failure) descriptor.localError = failure.reason
+          }
+        }
+      }
+    }
+    for (const child of Object.values(record)) visit(child)
+  }
+  visit(value)
+  return JSON.stringify(value, null, 2)
+}
+
+interface RuntimeInboxResponse {
+  rows?: Array<{
+    id?: string
+    conversation_id?: string
+    conversation_kind?: string
+    conversation_title?: string
+    conversation_topic?: string | null
+    project_id?: string | null
+    project_name?: string | null
+    author_name?: string
+    author_kind?: string
+    body?: string
+    kind?: string
+    /** Legacy first-entry projection for clients that predate multi-attachments. */
+    attachment?: AttachmentDescriptor | null
+    /** Canonically ordered message attachments. */
+    attachments?: AttachmentDescriptor[]
+    sequence?: number
+  }>
+}
+
+// How many unread MESSAGE lines the pre-loaded wake digest may carry. It rides
+// in EVERY chat turn's prompt (see chatDelta), so it stays small.
+const DIGEST_MAX_MESSAGE_LINES = 40
+
+/** Render the pre-loaded unread digest for the wake prompt within
+ *  DIGEST_MAX_MESSAGE_LINES.
+ *
+ *  The budget is spent PER CONVERSATION rather than as one global "newest N
+ *  lines" tail, because `ackSeen` marks the WHOLE snapshot read: anything the
+ *  digest leaves out is marked read having never been shown, and since
+ *  mark-read pins each conversation's cursor at its NEWEST message it can never
+ *  resurface in a later wake. A global tail let a burst in one busy room evict —
+ *  and then ack away — every message of a quieter conversation, including a
+ *  human DM the agent could not even name afterwards. The cloud path avoids this
+ *  by giving every conversation with unread its own window (see loadContext).
+ *
+ *  Whatever the budget still cannot fit is announced IN PLACE with its exact
+ *  count and the command that reads it, so the engine can recover the rest
+ *  instead of never learning it existed. Conversations keep first-seen order and
+ *  their messages stay chronological; when everything fits, every unread line is
+ *  shown, exactly as before.
+ *
+ *  Exported for tests — pure, no server and no engine. */
+interface InboxDigestConversation {
+  head: string
+  msgs: string[]
+  ids?: string[]
+}
+
+function inboxDigestKeepCounts(
+  byConvo: Map<string, InboxDigestConversation>,
+  budget: number,
+): Map<string, number> {
+  // Water-fill quietest-first: each conversation takes at most an even share of
+  // what is LEFT, so a small conversation keeps all of its messages and the busy
+  // one absorbs the slack. When the total fits, this hands every conversation
+  // its full set (nothing omitted, nothing announced).
+  const keep = new Map<string, number>()
+  let lineBudget = budget
+  let unserved = byConvo.size
+  for (const [id, convo] of [...byConvo].sort((a, b) => a[1].msgs.length - b[1].msgs.length)) {
+    const n = Math.min(convo.msgs.length, Math.max(0, Math.floor(lineBudget / unserved)))
+    keep.set(id, n)
+    lineBudget -= n
+    unserved -= 1
+  }
+  return keep
+}
+
+/** IDs represented by the rendered digest lines. Attachment materialization
+ *  uses the same water-fill decision so it downloads exactly what the engine
+ *  is shown, rather than every unread row returned by /inbox. */
+export function visibleInboxMessageIds(
+  byConvo: Map<string, InboxDigestConversation>,
+  budget = DIGEST_MAX_MESSAGE_LINES,
+): Set<string> {
+  const keep = inboxDigestKeepCounts(byConvo, budget)
+  const visible = new Set<string>()
+  for (const [id, convo] of byConvo) {
+    const shown = keep.get(id) ?? 0
+    for (const messageId of (convo.ids ?? []).slice(convo.msgs.length - shown)) visible.add(messageId)
+  }
+  return visible
+}
+
+export function renderInboxDigest(
+  byConvo: Map<string, InboxDigestConversation>,
+  budget = DIGEST_MAX_MESSAGE_LINES,
+): string {
+  if (byConvo.size === 0) return ''
+  const keep = inboxDigestKeepCounts(byConvo, budget)
+  const lines: string[] = []
+  for (const [id, convo] of byConvo) {
+    const shown = keep.get(id) ?? 0
+    lines.push(convo.head)
+    // Never drop unread in SILENCE — this turn is about to mark it read.
+    if (convo.msgs.length > shown) {
+      lines.push(`  … ${convo.msgs.length - shown} older unread message(s) not shown — \`cumora messages ${id} --tail ${convo.msgs.length}\` to read them`)
+    }
+    // slice(length - shown), NOT slice(-shown): slice(-0) is slice(0) and would
+    // print everything for a conversation budgeted to zero.
+    lines.push(...convo.msgs.slice(convo.msgs.length - shown))
+  }
+  return lines.join('\n')
+}
+
+interface RuntimeInboxTriageResponse {
+  actionable?: boolean
+  reason?: string
+  promptNote?: string
+  source?: string
+}
+
+/** `/inbox-triage/payload`: either a verdict the server decided without a model
+ *  (hard rule / empty inbox), or the prompt for the daemon's LOCAL small brain. */
+interface RuntimeTriagePayload {
+  verdict?: RuntimeInboxTriageResponse
+  instructions?: string
+  input?: string
+  /** Direction-aware fail mode: TRUE when the wake is purely agent-to-agent
+   *  (no human in the unread set) → a LOCAL triage failure fails CLOSED
+   *  (suppress) instead of open, so a flaky local model can't amplify a loop.
+   *  Absent/false → fail open (a human is present; never leave them hanging). */
+  failClosed?: boolean
+}
+
+// ─── arg parsing ────────────────────────────────────────────────────────
+
+function parseArgs(argv: string[]): {
+  pair?: string; server?: string; engine?: string; provider?: string
+  installService?: boolean; uninstallService?: boolean; restart?: boolean; stop?: boolean
+  status?: boolean; logs?: boolean; version?: boolean; doctor?: boolean; help?: boolean
+  codexLogin?: boolean; migrateCodexSessions?: boolean
+} {
+  const out: ReturnType<typeof parseArgs> = {}
+  for (let i = 0; i < argv.length; i++) {
+    if (argv[i] === '--help' || argv[i] === '-h' || argv[i] === 'help') out.help = true
+    else if (argv[i] === '--pair') out.pair = argv[++i]
+    else if (argv[i].startsWith('--pair=')) out.pair = argv[i].slice('--pair='.length)
+    else if (argv[i] === '--provider') out.provider = argv[++i] || ''
+    else if (argv[i].startsWith('--provider=')) out.provider = argv[i].slice('--provider='.length)
+    else if (argv[i] === '--server') out.server = argv[++i]
+    else if (argv[i].startsWith('--server=')) out.server = argv[i].slice('--server='.length)
+    else if (argv[i] === '--engine') out.engine = argv[++i]
+    else if (argv[i].startsWith('--engine=')) out.engine = argv[i].slice('--engine='.length)
+    else if (argv[i] === '--install-service') out.installService = true
+    else if (argv[i] === '--uninstall-service') out.uninstallService = true
+    else if (argv[i] === '--restart') out.restart = true
+    else if (argv[i] === '--stop') out.stop = true
+    else if (argv[i] === '--status') out.status = true
+    else if (argv[i] === '--logs') out.logs = true
+    else if (argv[i] === '--doctor' || argv[i] === 'doctor') out.doctor = true
+    else if (argv[i] === '--codex-login') out.codexLogin = true
+    else if (argv[i] === '--migrate-codex-sessions') out.migrateCodexSessions = true
+    else if (argv[i] === '--version' || argv[i] === '-v') out.version = true
+  }
+  return out
+}
+
+// ─── HTTP helpers ───────────────────────────────────────────────────────
+
+/** Wall-clock cap on every SHORT request/response call to the server (status,
+ *  runs, token mint, heartbeat, agent sync).
+ *
+ *  Without this, a request that never answers — a half-open socket surviving a
+ *  laptop sleep/network switch, a hung proxy, a pod that accepted the connection
+ *  and stopped — parks the turn forever: `catch` only sees throws, never a
+ *  promise that simply doesn't settle. The turn's `finally { this.busy = false }`
+ *  never runs, so the agent stays permanently `busy`, every later wake collapses
+ *  to `turn busy — coalescing`, and the heartbeat interval stops going out until
+ *  the server marks the whole computer offline. One stalled socket takes down
+ *  every agent on the machine.
+ *
+ *  Deliberately NOT applied to the wake-stream (an intentionally long-lived SSE
+ *  connection, which has its own idle/backoff handling) or the npm version check. */
+const HTTP_TIMEOUT_MS = Math.max(1_000, Number(process.env.CUMORA_HTTP_TIMEOUT_MS ?? 20_000))
+
+async function api<T>(serverUrl: string, path: string, init: RequestInit): Promise<T> {
+  const res = await fetch(`${serverUrl}${path}`, {
+    ...init,
+    headers: { 'Content-Type': 'application/json', ...(init.headers ?? {}) },
+    signal: init.signal ?? AbortSignal.timeout(HTTP_TIMEOUT_MS),
+  })
+  if (!res.ok) {
+    const body = await res.text().catch(() => '')
+    throw new Error(`${init.method ?? 'GET'} ${path} → HTTP ${res.status} ${body.slice(0, 200)}`)
+  }
+  return res.json() as Promise<T>
+}
+
+/** Fire-and-forget runtime call (status / runs). Never throws — observability
+ *  must never break the agent loop. The timeout is what makes that promise hold
+ *  for a server that stops answering rather than refusing (see HTTP_TIMEOUT_MS):
+ *  an abort throws, so it lands in the catch and the turn proceeds. */
+async function runtimeBest(
+  serverUrl: string, path: string, token: string, body: unknown,
+): Promise<unknown> {
+  try {
+    const res = await fetch(`${serverUrl}/runtime${path}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
+    })
+    return res.ok ? await res.json().catch(() => null) : null
+  } catch { return null }
+}
+
+async function runtimeGet<T>(
+  serverUrl: string, path: string, token: string,
+): Promise<T | null> {
+  try {
+    const res = await fetch(`${serverUrl}/runtime${path}`, {
+      method: 'GET',
+      headers: { Authorization: `Bearer ${token}` },
+      signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
+    })
+    return res.ok ? await res.json().catch(() => null) as T | null : null
+  } catch { return null }
+}
+
+async function failureConversationIds(serverUrl: string, token: string, conversationId: string | null): Promise<string[]> {
+  if (conversationId) return [conversationId]
+  // A diagnostic lookup must not advance the agent's inbox freshness baseline.
+  const inbox = await runtimeGet<RuntimeInboxResponse>(serverUrl, '/inbox?probe=1', token)
+  const ids = new Set<string>()
+  for (const row of inbox?.rows ?? []) {
+    if (typeof row.conversation_id === 'string' && row.conversation_id) ids.add(row.conversation_id)
+    if (ids.size >= 5) break
+  }
+  return [...ids]
+}
+
+/** Should this 20s fallback tick actually drain the inbox?
+ *
+ *  Yes when the wake-stream is not provably alive: never connected, or silent
+ *  (no event, no `: ping`) for WAKE_STREAM_STALE_MS. Otherwise the stream is
+ *  trusted to deliver wakes and the drain runs only as a slow double-check,
+ *  every INBOX_POLL_STREAM_HEALTHY_MS since the last drain. `streamLastSeenAt`
+ *  is null while disconnected. Exported for tests — pure. */
+export function fallbackPollDue(input: {
+  now: number
+  streamLastSeenAt: number | null
+  lastInboxDrainAt: number
+  staleMs?: number
+  healthyIntervalMs?: number
+}): boolean {
+  const staleMs = input.staleMs ?? WAKE_STREAM_STALE_MS
+  const healthyIntervalMs = input.healthyIntervalMs ?? INBOX_POLL_STREAM_HEALTHY_MS
+  const streamAlive = input.streamLastSeenAt !== null && input.now - input.streamLastSeenAt < staleMs
+  if (!streamAlive) return true
+  return input.now - input.lastInboxDrainAt >= healthyIntervalMs
+}
+
+/** Which conversation should show "<agent> is typing…" for this turn.
+ *
+ *  The wake's own conversation when it had one. Otherwise derive it from what is
+ *  unread, because a wake frequently carries none: a poll-driven turn never does
+ *  (only an SSE wake sets it, and polling is the only path left when the
+ *  wake-stream is down), and a wake that lands mid-turn is coalesced through
+ *  scheduleWake's busy branch, which re-kicks without a conversation.
+ *
+ *  `seen` is keyed by conversation_id, so the daemon already knows where the work
+ *  came from. With exactly one unread conversation that's unambiguous. With
+ *  several, stay silent rather than light up an arbitrary room — a wrong
+ *  indicator is worse than none, and the reply itself still lands correctly.
+ *
+ *  Exported for tests: this decides whether a working agent looks alive or dead,
+ *  and the "no indicator at all" case is the one users read as a hang. */
+export function typingConversation(
+  wakeConvo: string | null,
+  seen: Map<string, string>,
+): string | null {
+  if (wakeConvo) return wakeConvo
+  return seen.size === 1 ? [...seen.keys()][0] : null
+}
+
+/** Every conversation a turn must claim and then release: the unread snapshot
+ *  it was handed, plus the room picked for the "<agent> is typing…" indicator.
+ *
+ *  Both sides must use THIS list. `/thinking/mark` already claimed the whole
+ *  snapshot, so releasing only the indicator room left the other rooms' claims
+ *  to expire on their own TTL — and, because turn end is also where the
+ *  per-turn HELD counter is cleared, it left their hold counts alive into the
+ *  NEXT turn. An agent held twice in room X, with the indicator in room Y,
+ *  then escalated on its first hold of the following turn.
+ *
+ *  Exported for tests: the claim and the release drifting apart is invisible at
+ *  runtime until the counter misreads a fresh turn. */
+export function turnThinkingConvos(
+  convo: string | null,
+  seen: Map<string, string>,
+): string[] {
+  const ids = new Set(seen.keys())
+  if (convo) ids.add(convo)
+  return [...ids]
+}
+
+function hashText(text: string): string {
+  return createHash('sha1').update(text).digest('hex').slice(0, 12)
+}
+
+function conciseError(text: string): string {
+  return text
+    .replace(/\x1B\[[0-?]*[ -/]*[@-~]/g, '')
+    .replace(/\r/g, '')
+    .trim()
+    .slice(0, MAX_VISIBLE_ERROR_CHARS)
+}
+
+// A session that has grown past the model's context window. The daemon drops the
+// session on this error so the NEXT wake starts fresh — recovery is automatic.
+const CONTEXT_OVERFLOW_RE = /context window|context length|context_length_exceeded|maximum context|reached its context|prompt is too long|input is too long|too many tokens/i
+
+// A POISONED transcript: a string sliced mid-emoji left a lone UTF-16 surrogate,
+// and the Anthropic API's strict JSON parser rejected the request body. Once it's
+// in the persistent transcript every later turn re-sends it → wedged forever. Only
+// dropping the session clears it (same recovery shape as a context overflow). We
+// also scrub outgoing text (engine.ts stripLoneSurrogates) so we stop creating it.
+const POISONED_BODY_RE = /no (?:low|high) surrogate|unpaired surrogate|lone surrogate|surrogate in string|request body is not valid json/i
+
+// A STALE resume target: we passed `--resume <id>` and the engine says it has no
+// such session. Dropping the id is the right recovery — the next wake starts a
+// fresh session instead of re-failing against a target that no longer exists.
+//
+// Every branch pairs the noun with FAILURE wording. A bare mention of a session
+// or conversation proves nothing: the engine's own event stream is full of them
+// (see `engineDiagnosticProse`), so matching the noun alone turned every
+// mid-turn engine death into a "stale resume target" and threw away the session
+// id that exists to recover the interrupted turn.
+const STALE_RESUME_RE = new RegExp([
+  // "No conversation found with session ID: …", "no such session",
+  // "No previous sessions found for this project" (gemini, when the whole
+  // chats dir is gone). The trailing `s?` is load-bearing: an engine that
+  // reports the miss in the PLURAL is saying the resume target is gone just as
+  // plainly as the singular, and without it the daemon kept the dead id and
+  // re-sent it every wake — a permanently wedged agent, not a degraded one.
+  String.raw`\bno (?:such )?(?:\w+ )?(?:conversation|session|thread)s?\b`,
+  // "Session not found", "conversation no longer exists", "thread has expired"
+  String.raw`\b(?:conversation|session|thread)s?(?: id)?\b[^\n]{0,24}?\b(?:not found|no longer exists?|do(?:es)? not exist|doesn't exist|has expired|is expired|is invalid|is unknown)\b`,
+  // "Invalid session id", "unknown conversation", "expired thread"
+  String.raw`\b(?:invalid|unknown|expired|stale|malformed) (?:\w+ )?(?:conversation|session|thread)s?\b`,
+  // "could not resume", "unable to resume this conversation", "failed to resume"
+  String.raw`\b(?:could ?n(?:o|')?t|cannot|can't|unable to|failed to)\b[^\n]{0,24}?\bresume\b`,
+  // codex app-server's own wording
+  String.raw`\bthread/resume failed\b`,
+].join('|'), 'i')
+
+/** The human-readable part of an engine failure blob.
+ *
+ *  `failurePreview` (engine.ts) appends the tail of the engine's STDOUT to the
+ *  error text, and on the Claude path that stdout is stream-json: EVERY event
+ *  line carries a `"session_id"` field. Those lines are machine structure, not
+ *  diagnosis, so pattern-matching them as prose is what produced the false
+ *  "stale resume target" verdict on any mid-turn death. Keep an event line's
+ *  error text (that IS diagnosis) and drop everything else about it. */
+export function engineDiagnosticProse(err: string): string {
+  const out: string[] = []
+  for (const line of err.split('\n')) {
+    const trimmed = line.trim()
+    if (!trimmed.startsWith('{')) { out.push(line); continue }
+    let ev: { is_error?: unknown; result?: unknown; error?: unknown }
+    try { ev = JSON.parse(trimmed) } catch { continue }
+    // `result` is prose only on a FAILED turn; on a successful one it's the
+    // agent's own answer, which must never be read as an engine diagnosis.
+    if (ev.is_error === true && typeof ev.result === 'string') out.push(ev.result)
+    if (typeof ev.error === 'string') out.push(ev.error)
+    else if (ev.error && typeof ev.error === 'object') {
+      const m = (ev.error as { message?: unknown }).message
+      if (typeof m === 'string') out.push(m)
+    }
+  }
+  return out.join('\n')
+}
+
+/** True when an engine error really says the `--resume` target is gone. */
+export function isStaleResumeError(err: string): boolean {
+  return STALE_RESUME_RE.test(engineDiagnosticProse(err))
+}
+
+export function authFailureHint(engine: EngineId, detail: string): string {
+  if(engine==='api')return '请打开角色设置 → 模型连接，测试当前接口。服务商返回的错误不会通过重新登录 Codex 或 Claude Code 解决。'
+  if (/Endpoint is unavailable/i.test(detail)) {
+    return '接口服务商的上游模型端点不可用。请在角色设置的“模型连接”中测试连接，检查服务商状态或选择其他可用模型。'
+  }
+  if (classifyEngineFailure(engineDiagnosticProse(detail)) === 'startup') {
+    return 'The local engine could not start. Check the executable path and sandbox configuration on that computer, then wake the agent again.'
+  }
+  if (CONTEXT_OVERFLOW_RE.test(detail)) {
+    return 'The agent filled up its context window. Its session has been reset automatically — just wake the agent again and it will start fresh.'
+  }
+  if (POISONED_BODY_RE.test(detail)) {
+    return 'A malformed character (a split emoji) had poisoned the agent\'s session. It has been reset automatically — just wake the agent again.'
+  }
+  if (classifyEngineFailure(detail) !== 'authentication' && !/(auth|login|token|quota|credit|billing|subscription|rate limit|usage limit|api key)/i.test(detail)) {
+    return 'Check the daemon terminal for details, then wake the agent again.'
+  }
+  if (engine === 'claude') {
+    return 'Open Claude Code on that computer and sign in, refresh quota, or add credits, then wake the agent again.'
+  }
+  if (engine === 'codex') {
+    return `Run \`${CODEX_LOGIN_COMMAND}\` on that computer to sign in to Cumora's isolated Codex runtime (or check the account quota), then wake the agent again.`
+  }
+  if (engine === 'grok') {
+    return 'Open Grok Build on that computer and run `grok login`, or set XAI_API_KEY, then wake the agent again.'
+  }
+  if (engine === 'cursor') {
+    return 'Open a terminal on that computer and run `cursor-agent login` (or fix its quota / API key), then wake the agent again.'
+  }
+  if (engine === 'opencode') {
+    return 'Open a terminal on that computer and run `opencode providers login` (or fix the selected provider/model quota), then wake the agent again.'
+  }
+  if (engine === 'pi') {
+    return 'Open pi on that computer and run `/login` for its provider (or fix the API key / quota), then wake the agent again.'
+  }
+  if (engine === 'gemini') {
+    return 'Open Gemini CLI on that computer and run `gemini` to refresh its login, API key, or quota, then wake the agent again.'
+  }
+  if (engine === 'qwen') {
+    return 'Open Qwen Code on that computer and run `qwen` to refresh its login, API key, or quota, then wake the agent again.'
+  }
+  if (engine === 'antigravity') {
+    return 'Open Antigravity on that computer and run `agy` to refresh its login, model access, or quota, then wake the agent again.'
+  }
+  if (engine === 'zcode') {
+    return 'Open ZCode on that computer and run `zcode` to refresh its login, model access, or quota, then wake the agent again.'
+  }
+  if (engine === 'maka') {
+    return 'Open Maka on that computer and run `maka` to refresh its login, model access, or quota, then wake the agent again.'
+  }
+  if (engine === 'omp') {
+    return 'Open a terminal on that computer and run `omp` (or `omp login`) to refresh its provider credentials, then wake the agent again.'
+  }
+  return 'Check the daemon terminal for details, then wake the agent again.'
+}
+
+function missingEngineMessage(): string {
+  return [
+    'no supported local agent engine found on PATH',
+    '',
+    'Secure default — install and sign in to at least one of:',
+    '  - Claude Code: install the `claude` CLI, then run `claude` once to sign in',
+    `  - Codex: install the \`codex\` CLI, then run \`${CODEX_LOGIN_COMMAND}\``,
+    '',
+    'Unsandboxed compatibility engines (explicit opt-in required):',
+    '  - Grok Build: install the `grok` CLI, then run `grok login` once',
+    '  - Cursor Agent: install Cursor (the `cursor-agent` CLI ships with it), then run `cursor-agent login`',
+    '  - OpenCode: install the `opencode` CLI, then run `opencode providers login` once',
+    '  - pi: `npm install -g --ignore-scripts @earendil-works/pi-coding-agent`, then run `pi` once and `/login` a provider',
+    '  - Gemini CLI: install the `gemini` CLI, then run `gemini` once to sign in',
+    '  - Qwen Code: install the `qwen` CLI, then run `qwen` once to sign in',
+    '  - Antigravity: install the `agy` CLI, then run `agy` once to sign in',
+    '  - ZCode: install the `zcode` CLI, then run `zcode` once to sign in',
+    '    (the daemon drives it through the npm-published `zcode-acp-server` bridge via npx;',
+    '     CUMORA_ZCODE_ACP_BIN pins a specific bridge copy when needed)',
+    '  - Maka: install the `maka` CLI, then run `maka` once to sign in',
+    '  - omp: install the `omp` CLI, then run `omp` once to sign in to a provider',
+    '',
+    'After that, rerun:',
+    '  npx cumora@latest agent computer --pair <code>',
+  ].join('\n')
+}
+
+function unsandboxedCompatibilityHint(platform: NodeJS.Platform): string {
+  return platform === 'win32'
+    ? [
+        '  PowerShell:',
+        "    $env:CUMORA_BYOA_ALLOW_UNSANDBOXED = '1'",
+        '    # Then rerun your original Cumora command in this PowerShell session.',
+      ].join('\n')
+    : '  CUMORA_BYOA_ALLOW_UNSANDBOXED=1 npx cumora@latest agent computer ...'
+}
+
+function sandboxedEngineMessage(installed: readonly EngineId[], platform: NodeJS.Platform = process.platform): string {
+  return [
+    `installed engines are disabled by Cumora's secure BYOA default: ${installed.join(', ')}`,
+    '',
+    platform === 'win32'
+      ? 'Use Codex on native Windows, or run Claude Code inside WSL2.'
+      : 'Install and sign in to Claude Code or Codex.',
+    'Grok, Cursor, OpenCode, pi, Gemini, Qwen, Antigravity, and native-Windows Claude currently lack',
+    'a Cumora-verified fail-closed host boundary.',
+    '',
+    'Compatibility only (grants the model your host files, environment, and network):',
+    unsandboxedCompatibilityHint(platform),
+  ].join('\n')
+}
+
+function incapableEngineMessage(blocked: ReadonlyArray<{ id: EngineId; reason: string }>, platform: NodeJS.Platform = process.platform): string {
+  return [
+    'installed secure engines cannot enforce Cumora\'s BYOA boundary:',
+    ...blocked.map(({ id, reason }) => `  - ${id}: ${reason}`),
+    '',
+    'Update the CLI and install any named sandbox dependencies, then retry.',
+    'Compatibility only (disables this capability gate and host boundary):',
+    unsandboxedCompatibilityHint(platform),
+  ].join('\n')
+}
+
+function helpText(): string {
+  return [
+    'cumora agent computer — run your Cumora agents on THIS machine (BYOA)',
+    '',
+    'The daemon talks to a Cumora server over HTTP and drives a local agent',
+    'engine. Claude Code and Codex are sandboxed by default. Grok Build, Cursor',
+    'Agent, OpenCode, pi, Gemini, Qwen, Antigravity, and native-Windows Claude require the explicit',
+    'high-risk CUMORA_BYOA_ALLOW_UNSANDBOXED=1 compatibility switch.',
+    'Pair once, then the daemon runs in the background.',
+    '',
+    'Usage:',
+    '  npx cumora@latest agent computer --pair <code> [--server <url>] [--engine <id>]',
+    '  npx cumora@latest agent computer [--server <url>]',
+    '',
+    'Setup:',
+    '  --pair <code>        pair this machine to your account (code from',
+    '                       Cumora -> You -> Computers -> Add a computer)',
+    '  --server <url>       Cumora server URL (default: ' + DEFAULT_SERVER + ')',
+    '  --engine <id>        force an engine: ' + ENGINE_IDS.join(' | ') + '',
+    '  --codex-login        sign in to Cumora\'s isolated Codex runtime',
+    '  --migrate-codex-sessions  copy existing Cumora Codex threads into that runtime',
+    '',
+    'Background service:',
+    '  --install-service    install + start the background supervisor',
+    '  --uninstall-service  remove the background supervisor',
+    '  --restart            restart the background service',
+    '  --stop               stop the background service',
+    '  --status             show pairing + service status',
+    '  --logs               tail the daemon logs',
+    '',
+    'Diagnostics:',
+    '  --doctor             check engines, PATH, login/quota',
+    '  --provider <id>      with --doctor: check one local Claude provider profile',
+    '  --version, -v        print the daemon version',
+    '  --help, -h           show this help',
+    '',
+    'With no flags it starts the daemon in the foreground (must be paired first).',
+  ].join('\n')
+}
+
+/** Snapshot rows for refused engines, each carrying the reason it was refused.
+ *  Reported alongside the runnable ones so the card can explain an absence;
+ *  they never enter the `engines` list, which is what picks an adapter. */
+async function blockedSnapshotRows(
+  blocked: RunnableEngineEvaluation['blocked'],
+): Promise<DetectedEngineSnapshot[]> {
+  const rows = await snapshotDetectedEngines(blocked.map(({ id }) => id))
+  return rows.map((row) => ({
+    ...row,
+    blockedReason: blocked.find(({ id }) => id === row.id)?.reason,
+  }))
+}
+
+/** Diagnose an explicit choice without confusing installation with permission
+ * to run. Both inventories come from the same scan. */
+export function validatePairingEngine(
+  preferredEngine: string,
+  installed: readonly EngineId[],
+  evaluated: RunnableEngineEvaluation,
+  platform: NodeJS.Platform = process.platform,
+): void {
+  if (!ENGINE_IDS.includes(preferredEngine as EngineId)) {
+    throw new Error(`--engine must be one of: ${ENGINE_IDS.join(', ')} (got "${preferredEngine}")`)
+  }
+  const id = preferredEngine as EngineId
+  if (!installed.includes(id)) {
+    throw new Error(`--engine ${id} chosen, but ${id} was not found on PATH. Installed: ${installed.join(', ') || 'none'}.`)
+  }
+  if (!evaluated.runnable.includes(id)) {
+    const blocked = evaluated.blocked.find((entry) => entry.id === id)
+    throw new Error([
+      `--engine ${id} chosen: ${id} is installed but cannot run under Cumora's secure BYOA default.`,
+      blocked ? incapableEngineMessage([blocked], platform) : sandboxedEngineMessage([id], platform),
+    ].join('\n\n'))
+  }
+}
+
+/** The engines this machine can run, plus the ones it cannot and why.
+ *
+ *  The refusals used to stop at the console.warn below. Pairing then reported
+ *  only the runnable list, so a fresh computer's card said nothing about the
+ *  engine that was skipped until the first PATH rescan minutes later — which is
+ *  precisely the window in which someone asks why their Claude Code is not
+ *  listed. */
+async function requireLocalEngine(preferredEngine?: string): Promise<RunnableEngineEvaluation> {
+  const detected = await detectEnginesWithStatus()
+  if (!detected.reliable) {
+    throw new Error('could not scan PATH (`which` / `where` failed). Fix that, then retry pairing.')
+  }
+  const evaluated = await evaluateRunnableEngines(detected.engines)
+  // Check the requested engine against the raw PATH inventory first. The
+  // runnable list excludes installed engines refused by the security policy.
+  if (preferredEngine) validatePairingEngine(preferredEngine, detected.engines, evaluated)
+  if (detected.engines.length === 0) throw new Error(missingEngineMessage())
+  if (evaluated.runnable.length === 0) {
+    if (evaluated.blocked.length > 0) throw new Error(incapableEngineMessage(evaluated.blocked))
+    throw new Error(sandboxedEngineMessage(detected.engines))
+  }
+  if (evaluated.blocked.length > 0) {
+    console.warn(`[computer] secure engine(s) disabled: ${evaluated.blocked.map(({ id, reason }) => `${id} (${reason})`).join('; ')}`)
+  }
+  return evaluated
+}
+
+/** Resolve the engine a daemon can actually run from its LIVE PATH inventory. */
+export function resolveAvailableEngine(
+  requested: EngineId | null | undefined,
+  available: readonly EngineId[],
+): EngineId | null {
+  return requested && available.includes(requested) ? requested : (available[0] ?? null)
+}
+
+export interface EngineInventory {
+  current: EngineId[]
+}
+
+/** Hysteresis for trustworthy scans. A previously runnable engine survives a
+ * transient capability probe and two consecutive PATH misses. Confirmed
+ * incompatibility removes it immediately because the security floor is not a
+ * liveness signal and must never be debounced. */
+export class EngineInventoryStabilizer {
+  private readonly missingCounts = new Map<EngineId, number>()
+
+  constructor(private readonly missingThreshold = 3) {}
+
+  stabilize(
+    previous: readonly EngineId[],
+    installed: readonly EngineId[],
+    evaluated: RunnableEngineEvaluation,
+  ): EngineId[] {
+    const installedSet = new Set(installed)
+    const runnableSet = new Set(evaluated.runnable)
+    const transientSet = new Set([
+      ...evaluated.temporarilyUnverifiable ?? [],
+      ...evaluated.blocked.filter((entry) => entry.state === 'temporarily-unverifiable').map((entry) => entry.id),
+    ])
+    const incompatibleSet = new Set(evaluated.blocked
+      .filter((entry) => entry.state === 'confirmed-incompatible')
+      .map((entry) => entry.id))
+    const next: EngineId[] = []
+
+    for (const id of previous) {
+      if (incompatibleSet.has(id)) {
+        this.missingCounts.delete(id)
+        continue
+      }
+      if (installedSet.has(id)) {
+        this.missingCounts.delete(id)
+        if (runnableSet.has(id) || transientSet.has(id)) next.push(id)
+        continue
+      }
+      const misses = (this.missingCounts.get(id) ?? 0) + 1
+      this.missingCounts.set(id, misses)
+      if (misses < this.missingThreshold) next.push(id)
+    }
+
+    for (const id of installed) {
+      if (runnableSet.has(id)) {
+        this.missingCounts.delete(id)
+        if (!next.includes(id)) next.push(id)
+      }
+    }
+    return next
+  }
+}
+
+/** Replace the shared engine inventory after a trustworthy PATH scan. */
+export function replaceEngineInventory(inventory: EngineInventory, next: readonly EngineId[]): boolean {
+  const current = inventory.current
+  const changed = next.length !== current.length || next.some((engine, i) => engine !== current[i])
+  if (changed) inventory.current = [...next]
+  return changed
+}
+
+/** A user-requested refresh must report even an unchanged snapshot so the
+ * server can clear the pending request and the UI can observe completion. */
+export function shouldReportEngineSnapshot(fingerprint: string, previous: string, force = false): boolean {
+  return force || fingerprint !== previous
+}
+
+/**
+ * Report the engine snapshot and return the fingerprint the daemon should
+ * remember — which is the OLD one whenever the report did not land.
+ *
+ * The predicate above is `force || fingerprint !== previous`, so the remembered
+ * fingerprint is a delivery watermark, not a "what did I last compute" note.
+ * Advancing it before the POST resolves makes a failure indistinguishable from
+ * a success: every later rescan re-derives the same fingerprint, skips the
+ * report, and the machine's card stays frozen at whatever the server last saw.
+ * An operator who installs the missing dependency an engine was blocked on
+ * would watch the card keep saying it is missing until they either hit Rescan
+ * (the only caller that passes `force`) or restart the daemon.
+ *
+ * Separate from the scan loop so this rule is testable without a daemon.
+ */
+export async function reportEngineSnapshot(
+  fingerprint: string,
+  previous: string,
+  force: boolean,
+  post: () => Promise<unknown>,
+): Promise<string> {
+  if (!shouldReportEngineSnapshot(fingerprint, previous, force)) return previous
+  try {
+    await post()
+    return fingerprint
+  } catch (err) {
+    console.warn(
+      '[computer] engine snapshot report failed; retrying on the next scan:',
+      err instanceof Error ? err.message : err,
+    )
+    return previous
+  }
+}
+
+// ─── config ─────────────────────────────────────────────────────────────
+
+async function loadConfig(): Promise<DaemonConfig | null> {
+  try { return JSON.parse(await readFile(CONFIG_PATH, 'utf8')) as DaemonConfig }
+  catch { return null }
+}
+
+async function saveConfig(cfg: DaemonConfig): Promise<void> {
+  await mkdir(CONFIG_DIR, { recursive: true })
+  await writeFile(CONFIG_PATH, JSON.stringify(cfg, null, 2), 'utf8')
+  await chmod(CONFIG_PATH, 0o600)
+}
+
+/** Apply the server's durable preference before any engine capability checks. */
+async function syncUnsandboxedPreference(cfg: DaemonConfig): Promise<void> {
+  try {
+    const result = await api<{ enabled?: unknown }>(cfg.serverUrl, '/api/computers/me/unsandboxed-mode', {
+      headers: { Authorization: `Bearer ${cfg.deviceToken}` },
+    })
+    if (typeof result.enabled === 'boolean') {
+      cfg.unsandboxed = result.enabled
+      await saveConfig(cfg)
+    }
+  } catch (err) {
+    console.warn('[computer] could not refresh security mode; using the last saved preference:', err instanceof Error ? err.message : err)
+  }
+  if (typeof cfg.unsandboxed === 'boolean') {
+    if (cfg.unsandboxed) process.env.CUMORA_BYOA_ALLOW_UNSANDBOXED = '1'
+    else delete process.env.CUMORA_BYOA_ALLOW_UNSANDBOXED
+  }
+}
+
+// ─── the `cumora` shim ──────────────────────────────────────────────────
+//
+// The engine must be able to use Cumora without also receiving a reusable JWT
+// or arbitrary network access. The fixed MCP bridge calls a tiny `cumora`
+// executable in a daemon-owned tools directory; that client writes argv into a
+// per-agent rendezvous directory outside the model home and waits for the daemon
+// to answer. The daemon alone owns the runtime token and performs the HTTP call.
+//
+// Files rather than a TCP/Unix socket are deliberate: every supported engine
+// can keep tool subprocesses network-denied, and the protocol works on macOS,
+// Linux, native Windows, and WSL without punching a hole in that boundary.
+//
+// Exported for tests: the output-truncation regression below is only observable
+// by running the real shim text against a real pipe.
+export const CUMORA_SHIM = `#!/usr/bin/env node
+'use strict'
+;(async () => {
+  var ipc = process.env.CUMORA_AGENT_IPC_DIR
+  if (!ipc) { console.error('cumora: runtime IPC not set'); process.exit(70) }
+  var argv = process.argv.slice(2)
+  // Shell-safe body input. A reply written inline (cumora reply id "..text..")
+  // is mangled by bash BEFORE this shim runs: backticks and $(...) get run as
+  // commands and collapse to empty, quotes get eaten. So --file <path> /
+  // --stdin let the body come from a file (written by the editor, no shell) or
+  // a pipe; we read it LOCALLY and pass it as one argument that travels as
+  // JSON and is never re-parsed by a shell, so code/quotes/$ survive verbatim.
+  //
+  // It goes LAST, behind a POSIX \`--\`, so the server takes it literally. Spliced
+  // in place it was still read as argv: a body starting with \`---\` (markdown
+  // rule, front-matter fence, diff header) parsed as a FLAG and the message was
+  // silently dropped, and escapes inside it were expanded a second time.
+  var fs = require('fs')
+  var path = require('path')
+  var crypto = require('crypto')
+  var body = null
+  var fi = argv.indexOf('--file')
+  if (fi >= 0 && argv[fi + 1] !== undefined) {
+    try { body = fs.readFileSync(argv[fi + 1], 'utf8') }
+    catch (e) { console.error('cumora: cannot read --file ' + argv[fi + 1]); process.exit(70) }
+    argv.splice(fi, 2)
+  }
+  var si = argv.indexOf('--stdin')
+  if (si >= 0) {
+    argv.splice(si, 1)
+    if (body === null) { try { body = fs.readFileSync(0, 'utf8') } catch (e) { body = '' } }
+  }
+  if (body !== null) argv.push('--', body)
+  var id = crypto.randomUUID()
+  var requests = path.join(ipc, 'requests')
+  var responses = path.join(ipc, 'responses')
+  var request = path.join(requests, id + '.json')
+  var staged = request + '.' + process.pid + '.tmp'
+  fs.writeFileSync(staged, JSON.stringify({ argv: argv }), { mode: 0o600 })
+  fs.renameSync(staged, request)
+
+  var response = path.join(responses, id + '.json')
+  var deadline = Date.now() + 5 * 60 * 1000
+  while (!fs.existsSync(response)) {
+    if (Date.now() >= deadline) {
+      try { fs.unlinkSync(request) } catch (e) {}
+      console.error('cumora: daemon IPC timed out')
+      process.exit(70)
+    }
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25)
+  }
+  var data
+  try { data = JSON.parse(fs.readFileSync(response, 'utf8')) }
+  finally { try { fs.unlinkSync(response) } catch (e) {} }
+  if (data && typeof data.error === 'string' && data.error) console.error('cumora: ' + data.error)
+  const code = typeof data.exitCode === 'number' ? data.exitCode : 0
+  // Exit from the write CALLBACK, not the next statement: stdout on a PIPE is
+  // ASYNC, so process.exit() kills us with the tail still buffered. The engine
+  // always runs this shim with stdout piped, so a big result (cumora messages
+  // --tail 30, cumora inbox --json) silently arrived truncated at the pipe
+  // buffer — 64KB, or 8KB on the socketpair a stdio:'pipe' parent hands us —
+  // with exit 0 and empty stderr, so nothing signalled the loss and --json
+  // output simply failed to parse. Exiting IN the callback also keeps a reader
+  // that closed early (| head) an exit-0 like before, instead of the unhandled
+  // EPIPE crash a bare process.exitCode would produce.
+  if (typeof data.text === 'string' && data.text) process.stdout.write(data.text + '\\n', () => process.exit(code))
+  else process.exit(code)
+})().catch((e) => { console.error('cumora:', (e && e.message) || e); process.exit(70) })
+`
+
+/** The fixed MCP bridge keeps Cumora actions outside the model's command
+ * sandbox without exposing daemon credentials. Local-body flags are rejected
+ * because MCP is not sandboxed; callers pass body text as an argv item instead. */
+export const CUMORA_MCP_SHIM = `#!/usr/bin/env node
+'use strict'
+var cp = require('child_process')
+var path = require('path')
+var readline = require('readline')
+var shim = path.join(__dirname, 'cumora')
+var childEnv = {}
+;['PATH', 'HOME', 'USER', 'LOGNAME', 'SHELL', 'TMPDIR', 'TMP', 'TEMP', 'LANG', 'LANGUAGE', 'TERM', 'NO_COLOR', 'SYSTEMROOT', 'COMSPEC', 'PATHEXT', 'WINDIR', 'CUMORA_AGENT_IPC_DIR', 'CUMORA_AGENT_ID'].forEach(function (name) {
+  if (process.env[name] !== undefined) childEnv[name] = process.env[name]
+})
+function send(id, result, error) {
+  var msg = { jsonrpc: '2.0', id: id }
+  if (error) msg.error = { code: -32602, message: error }
+  else msg.result = result
+  process.stdout.write(JSON.stringify(msg) + '\\n')
+}
+function toolError(text) {
+  return { content: [{ type: 'text', text: text }], isError: true }
+}
+function handle(msg) {
+  if (!msg || msg.jsonrpc !== '2.0') return
+  if (msg.method === 'initialize' && msg.id !== undefined) {
+    send(msg.id, {
+      protocolVersion: (msg.params && msg.params.protocolVersion) || '2025-06-18',
+      capabilities: { tools: {} },
+      serverInfo: { name: 'cumora', version: '1.0.0' },
+    })
+    return
+  }
+  if (msg.method === 'tools/list' && msg.id !== undefined) {
+    send(msg.id, { tools: [{
+      name: 'cli',
+      description: 'Act in Cumora. Pass command-line words as argv; put message bodies directly in argv and never use local file paths.',
+      inputSchema: {
+        type: 'object',
+        properties: { argv: { type: 'array', items: { type: 'string' }, minItems: 1, maxItems: 2000 } },
+        required: ['argv'],
+        additionalProperties: false,
+      },
+    }] })
+    return
+  }
+  if (msg.method === 'tools/call' && msg.id !== undefined) {
+    var p = msg.params || {}
+    var argv = p.arguments && p.arguments.argv
+    if (p.name !== 'cli' || !Array.isArray(argv) || !argv.length || argv.length > 2000 || argv.some(function (v) { return typeof v !== 'string' })) {
+      send(msg.id, toolError('invalid Cumora argv'))
+      return
+    }
+    if (argv.some(function (v) { return v === '--file' || v === '--stdin' })) {
+      send(msg.id, toolError('local file/stdin flags are unavailable; pass body text directly in argv'))
+      return
+    }
+    cp.execFile(process.execPath, [shim].concat(argv), {
+      env: childEnv,
+      maxBuffer: 32 * 1024 * 1024,
+      windowsHide: true,
+    }, function (err, stdout, stderr) {
+      var text = String(stdout || '')
+      if (stderr) text += (text ? '\\n' : '') + String(stderr)
+      var failed = !!err
+      send(msg.id, { content: [{ type: 'text', text: text.trimEnd() }], isError: failed })
+    })
+    return
+  }
+  if (msg.method === 'ping' && msg.id !== undefined) send(msg.id, {})
+}
+var rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity })
+rl.on('line', function (line) {
+  try { handle(JSON.parse(line)) }
+  catch (e) { process.stderr.write('cumora-mcp: invalid JSON\\n') }
+})
+`
+
+const CLI_IPC_FALLBACK_POLL_MS = 1_000
+const CLI_IPC_MAX_REQUEST_BYTES = 32 * 1024 * 1024
+const CLI_IPC_MAX_ARGS = 2_000
+
+export interface RuntimeCliBrokerResult {
+  text?: string
+  exitCode: number
+  error?: string
+}
+
+/** File-rendezvous broker used by one AgentRunner.
+ *
+ * Request names come from readdir(), not request content, and are claimed by an
+ * atomic rename before parsing. A malformed/oversized request gets a bounded
+ * error response; it can never turn into a path chosen by the model. */
+export class RuntimeCliBroker {
+  private timer: ReturnType<typeof setInterval> | null = null
+  private watcher: FSWatcher | null = null
+  private pollPromise: Promise<void> | null = null
+  private rerunRequested = false
+  private stopped = false
+  private abortController = new AbortController()
+  private readonly requestsDir: string
+  private readonly responsesDir: string
+
+  constructor(
+    ipcDir: string,
+    private readonly processingDir: string,
+    private readonly invoke: (argv: string[], signal: AbortSignal) => Promise<RuntimeCliBrokerResult>,
+  ) {
+    this.requestsDir = join(ipcDir, 'requests')
+    this.responsesDir = join(ipcDir, 'responses')
+  }
+
+  async start(): Promise<void> {
+    // A stopped broker may be started again by a supervisor. Never clean or
+    // reuse its namespace while the previous drain is still unwinding.
+    if (this.pollPromise) await this.pollPromise.catch(() => {})
+    this.pollPromise = null
+    this.rerunRequested = false
+    await mkdir(this.requestsDir, { recursive: true })
+    await mkdir(this.responsesDir, { recursive: true })
+    await mkdir(this.processingDir, { recursive: true })
+    // Requests/responses cannot survive their daemon process: the bearer token
+    // and server result they belonged to are gone. Remove only this dedicated
+    // IPC namespace, never agent work files.
+    await this.clearDir(this.requestsDir)
+    await this.clearDir(this.responsesDir)
+    await this.clearDir(this.processingDir)
+    this.stopped = false
+    this.abortController = new AbortController()
+    // Directory notifications keep the common path event-driven even when one
+    // computer hosts many agents. A slow fallback poll covers dropped watcher
+    // events and filesystems where fs.watch is unavailable or unreliable.
+    try {
+      this.watcher = watch(this.requestsDir, { persistent: false }, () => {
+        void this.poll().catch((err) => this.logPollFailure(err))
+      })
+      this.watcher.on('error', () => {
+        this.watcher?.close()
+        this.watcher = null
+      })
+    } catch { this.watcher = null }
+    this.timer = setInterval(() => {
+      void this.poll().catch((err) => this.logPollFailure(err))
+    }, CLI_IPC_FALLBACK_POLL_MS)
+    this.timer.unref?.()
+  }
+
+  stop(): void {
+    this.stopped = true
+    this.rerunRequested = false
+    this.abortController.abort()
+    if (this.timer) clearInterval(this.timer)
+    this.timer = null
+    this.watcher?.close()
+    this.watcher = null
+  }
+
+  /** Immediate poll for deterministic tests; the normal runner uses the timer. */
+  poll(): Promise<void> {
+    if (this.stopped) return Promise.resolve()
+    // Coalesce an arbitrary watcher/timer storm into one pending rerun. Every
+    // caller shares the same drain promise, so an explicit await still covers a
+    // request that landed after the active pass took its readdir snapshot.
+    this.rerunRequested = true
+    if (!this.pollPromise) {
+      const drain = this.drainPolls()
+      this.pollPromise = drain
+      // Use both handlers instead of .finally(): ignoring the Promise returned
+      // by finally() would itself create an unhandled rejection on failure.
+      void drain.then(
+        () => { if (this.pollPromise === drain) this.pollPromise = null },
+        () => { if (this.pollPromise === drain) this.pollPromise = null },
+      )
+    }
+    return this.pollPromise
+  }
+
+  private async drainPolls(): Promise<void> {
+    while (!this.stopped && this.rerunRequested) {
+      this.rerunRequested = false
+      const names = await readdir(this.requestsDir).catch(() => [] as string[])
+      for (const name of names) {
+        if (this.stopped || this.abortController.signal.aborted) break
+        if (!/^[0-9a-f-]{36}\.json$/i.test(name)) continue
+        try { await this.handle(name) }
+        catch (err) { this.logPollFailure(err, name) }
+      }
+    }
+  }
+
+  private logPollFailure(err: unknown, name?: string): void {
+    console.error(
+      `[runtime] CLI IPC broker${name ? ` request ${name}` : ''} failed`,
+      err instanceof Error ? err.message : String(err),
+    )
+  }
+
+  private async handle(name: string): Promise<void> {
+    const signal = this.abortController.signal
+    if (signal.aborted) return
+    const source = join(this.requestsDir, name)
+    // Production puts processingDir outside the model-writable Agent home.
+    // Once rename succeeds, the sandbox cannot replace the claimed inode during
+    // the lstat/open gap (including on Windows, where O_NOFOLLOW is unavailable).
+    const claimed = join(this.processingDir, `${name}.${process.pid}.${randomUUID().slice(0, 8)}.processing`)
+    try { await rename(source, claimed) } catch { return }
+    const response = join(this.responsesDir, name)
+    let stagedResponse: string | null = null
+    let result: RuntimeCliBrokerResult
+    try {
+      // Never follow a model-created request symlink with the daemon's broader
+      // privileges. O_NOFOLLOW is defense in depth on POSIX; the private claim
+      // directory closes the check/open race on every supported platform.
+      const before = await lstat(claimed)
+      if (!before.isFile() || before.isSymbolicLink()) {
+        throw new Error('runtime IPC request is not a regular file')
+      }
+      const noFollow = typeof FS_CONSTANTS.O_NOFOLLOW === 'number' ? FS_CONSTANTS.O_NOFOLLOW : 0
+      const file = await open(claimed, FS_CONSTANTS.O_RDONLY | noFollow)
+      let raw: string
+      try {
+        const info = await file.stat()
+        if (!info.isFile() || info.size > CLI_IPC_MAX_REQUEST_BYTES) {
+          throw new Error('runtime IPC request is too large')
+        }
+        raw = await file.readFile('utf8')
+      }
+      finally { await file.close() }
+      const parsed = JSON.parse(raw) as { argv?: unknown }
+      if (!Array.isArray(parsed.argv)
+          || parsed.argv.length > CLI_IPC_MAX_ARGS
+          || parsed.argv.some((arg) => typeof arg !== 'string')) {
+        throw new Error('runtime IPC argv is invalid')
+      }
+      if (signal.aborted) throw new Error('runtime IPC request cancelled')
+      result = await this.invoke(parsed.argv as string[], signal)
+    } catch (err) {
+      if (signal.aborted) {
+        await rm(claimed, { force: true }).catch(() => {})
+        return
+      }
+      result = { exitCode: 70, error: err instanceof Error ? err.message : String(err) }
+    }
+    try {
+      if (signal.aborted) return
+      // Stage in the daemon-private directory. The model can write response
+      // contents only after the final atomic rename, never redirect a privileged
+      // write by pre-creating a symlink at a guessed temporary name.
+      stagedResponse = join(this.processingDir, `${name}.${process.pid}.${randomUUID().slice(0, 8)}.response.tmp`)
+      await writeFile(stagedResponse, JSON.stringify(result), { mode: 0o600 })
+      if (signal.aborted) return
+      await rename(stagedResponse, response)
+      stagedResponse = null
+    } finally {
+      if (stagedResponse) await rm(stagedResponse, { force: true }).catch(() => {})
+      await rm(claimed, { force: true }).catch(() => {})
+    }
+  }
+
+  private async clearDir(dir: string): Promise<void> {
+    const names = await readdir(dir).catch(() => [] as string[])
+    // These directories contain protocol files only. Never recurse into a
+    // model-created directory/junction while cleaning stale traffic.
+    await Promise.all(names.map((name) => rm(join(dir, name), { force: true }).catch(() => {})))
+  }
+}
+
+/** PowerShell only resolves files on PATH through PATHEXT, so the extensionless
+ *  POSIX shim needs a .cmd launcher on Windows. Keep the Node program itself in
+ *  one file so both launchers exercise the exact same argument/HTTP path. */
+export const CUMORA_WINDOWS_SHIM = '@echo off\r\nnode "%~dp0cumora" %*\r\n'
+
+export function prependAgentBinToPath(binDir: string, currentPath = process.env.PATH ?? ''): string {
+  return currentPath ? `${binDir}${delimiter}${currentPath}` : binDir
+}
+
+/** Secure adapters must resolve their own binary from the operator's original
+ * PATH. The agent home is model-writable, so prepending <home>/bin would let a
+ * model plant `claude`/`codex` and escape before the next sandbox starts. */
+export function engineProcessPath(
+  binDir: string,
+  currentPath = process.env.PATH ?? '',
+  unsandboxed = allowUnsandboxedByoa(),
+): string {
+  if (unsandboxed) return prependAgentBinToPath(binDir, currentPath)
+  const writableHome = resolve(dirname(binDir))
+  return currentPath
+    .split(delimiter)
+    // Empty and relative PATH entries resolve against the engine cwd — its
+    // model-writable home — and are therefore engine-shadow paths too.
+    .filter((entry) => {
+      if (!entry || !isAbsolute(entry)) return false
+      const fromHome = relative(writableHome, resolve(entry))
+      return isAbsolute(fromHome) || fromHome === '..' || fromHome.startsWith(`..${sep}`)
+    })
+    .join(delimiter)
+}
+
+async function writeShimFile(path: string, data: string, mode: number): Promise<void> {
+  const staged = join(dirname(path), `.cumora-shim-${process.pid}-${randomUUID()}.tmp`)
+  await writeFile(staged, data, { encoding: 'utf8', mode, flag: 'wx' })
+  try {
+    await chmod(staged, mode)
+    try { await rename(staged, path) }
+    catch (err) {
+      if (process.platform !== 'win32'
+          || !['EEXIST', 'EPERM'].includes((err as NodeJS.ErrnoException).code ?? '')) throw err
+      await rm(path, { force: true })
+      await rename(staged, path)
+    }
+  } finally {
+    await rm(staged, { force: true }).catch(() => {})
+  }
+}
+
+export async function writeShim(
+  binDir: string,
+  platform: NodeJS.Platform = process.platform,
+): Promise<void> {
+  try {
+    const info = await lstat(binDir)
+    if (!info.isDirectory() || info.isSymbolicLink()) {
+      throw new Error(`secure BYOA refuses linked shim directory: ${binDir}`)
+    }
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err
+    await mkdir(binDir, { recursive: true })
+    const created = await lstat(binDir)
+    if (!created.isDirectory() || created.isSymbolicLink()) {
+      throw new Error(`secure BYOA could not create a trusted shim directory: ${binDir}`)
+    }
+  }
+  await writeShimFile(join(binDir, 'cumora'), CUMORA_SHIM, 0o755)
+  await writeShimFile(join(binDir, 'cumora-mcp'), CUMORA_MCP_SHIM, 0o755)
+  if (platform === 'win32') {
+    await writeShimFile(join(binDir, 'cumora.cmd'), CUMORA_WINDOWS_SHIM, 0o600)
+  }
+}
+
+// ─── pairing ────────────────────────────────────────────────────────────
+
+/** A human-friendly machine name for the Computer. `os.hostname()` is
+ *  unreliable on macOS — when the BSD HostName is unset (the default) it
+ *  returns "localhost", not the machine's real name. So on macOS prefer the
+ *  OS's friendly ComputerName ("MacBook Air"), then LocalHostName; elsewhere
+ *  `os.hostname()` is fine. */
+async function detectHostName(): Promise<string> {
+  const base = hostname()
+  if (base && base.toLowerCase() !== 'localhost') return base
+  if (process.platform === 'darwin') {
+    for (const key of ['ComputerName', 'LocalHostName']) {
+      try {
+        const { stdout } = await execFileP('scutil', ['--get', key])
+        const name = stdout.trim()
+        if (name) return name
+      } catch { /* scutil missing / key unset — try the next */ }
+    }
+  }
+  return base || 'My computer'
+}
+
+async function doPair(code: string, serverUrl: string, preferredEngine?: string): Promise<void> {
+  const evaluated = await requireLocalEngine(preferredEngine)
+  const runnable = evaluated.runnable
+  // The chosen engine becomes this computer's DEFAULT — it's sent first in the
+  // engines list, which the server stores as available_engines[0] and uses as
+  // the engine for the starter team and any agent assigned here without an
+  // explicit override. (No separate column needed: "first = default".)
+  let engines = [...runnable]
+  if (preferredEngine) {
+    engines = [preferredEngine as EngineId, ...runnable.filter((e) => e !== preferredEngine)]
+  }
+  const blockedIds = evaluated.blocked.map(({ id }) => id)
+  const snapshot = [
+    ...await snapshotDetectedEngines(engines),
+    ...await blockedSnapshotRows(evaluated.blocked),
+  ]
+  const unsandboxed = allowUnsandboxedByoa()
+  const paired = await api<{ computerId: string; deviceToken: string }>(
+    serverUrl, '/api/computers/pair',
+    { method: 'POST', body: JSON.stringify({
+      code, hostName: await detectHostName(), engines, detected: snapshot,
+      blocked: blockedIds, version: CURRENT_VERSION, supervised: SUPERVISED, unsandboxed,
+    }) },
+  )
+  await saveConfig({ serverUrl, computerId: paired.computerId, deviceToken: paired.deviceToken, unsandboxed })
+  console.log(`[computer] paired as ${paired.computerId} (default engine: ${engines[0] ?? 'none'}; available: ${engines.join(', ') || 'none'}) — starting…`)
+}
+
+// ─── per-agent runner ───────────────────────────────────────────────────
+
+/** Buffered per-hop trajectory reporter. The engine sessions (ClaudeSession /
+ *  CodexSession) fire `onHopUsage` for every assistant message / turn-completed
+ *  event; this collects them and POSTs in batches so the universal llm_calls
+ *  ledger sees BYOA trajectory at the same granularity it sees cloud, without
+ *  paying a round-trip per hop.
+ *
+ *  Discipline:
+ *    - Fire-and-forget. A network blip on the report MUST NEVER affect the
+ *      engine turn that produced it.
+ *    - Bounded queue (MAX_BUFFER) so a hard server outage can't blow memory on
+ *      a long-running daemon — old hops are dropped first with a warn log.
+ *    - Auto-flush on every WINDOW_MS tick AND when buffer hits FLUSH_AT.
+ *    - flush() can be awaited at "natural pauses" (turn end) to push the tail
+ *      promptly without waiting for the timer. */
+type ByoaSource = `byoa-${EngineId}`
+
+function byoaSourceOf(id: EngineId): ByoaSource {
+  return `byoa-${id}`
+}
+
+interface PendingHop {
+  source: ByoaSource
+  purpose: 'agent-turn' | 'inbox-triage' | 'compaction' | 'completion-verify' | 'steer-summary' | 'agenda' | 'synthetic-wake-gate'
+  runId: string | null
+  conversationId: string | null
+  model: string
+  usage?: TokenUsage | null
+  latencyMs: number
+  status: 'ok' | 'rate_limited' | 'timeout' | 'failed'
+  error?: string | null
+  extras?: Record<string, unknown>
+}
+
+class HopReporter {
+  private buf: PendingHop[] = []
+  private timer: ReturnType<typeof setTimeout> | null = null
+  private stopped = false
+  private readonly WINDOW_MS = 250
+  private readonly FLUSH_AT = 10
+  private readonly MAX_BUFFER = 500
+  constructor(
+    private readonly serverUrl: string,
+    private readonly getToken: () => Promise<string>,
+  ) {}
+
+  push(hop: PendingHop): void {
+    if (this.stopped) return
+    if (this.buf.length >= this.MAX_BUFFER) {
+      // Drop the OLDEST entry — newer hops are more interesting + the bound
+      // protects the process from a hung server. We log once per overflow
+      // window so the log isn't a flood.
+      const dropped = this.buf.shift()
+      if (dropped) console.warn(`[hop-reporter] buffer overflow — dropped oldest hop (${dropped.purpose}, ${dropped.model})`)
+    }
+    this.buf.push(hop)
+    if (this.buf.length >= this.FLUSH_AT) { void this.flush(); return }
+    if (!this.timer) this.timer = setTimeout(() => { this.timer = null; void this.flush() }, this.WINDOW_MS)
+  }
+
+  /** Send everything queued right now. Idempotent + reentrant-safe — drains
+   *  the snapshot, leaves new pushes for the next flush. Resolves after the
+   *  HTTP attempt (or instantly if nothing to send). */
+  async flush(): Promise<void> {
+    if (this.timer) { clearTimeout(this.timer); this.timer = null }
+    if (this.buf.length === 0) return
+    // Snapshot + clear; new pushes during the await go to a fresh buffer.
+    const batch = this.buf
+    this.buf = []
+    // Codex + Claude batches might intermix (the same reporter is used across
+    // session lifetimes), so split by source — the server endpoint takes one
+    // source per call (the row's `source` column is set from it).
+    const byHourceSource = new Map<ByoaSource, PendingHop[]>()
+    for (const h of batch) {
+      const arr = byHourceSource.get(h.source) ?? []
+      arr.push(h); byHourceSource.set(h.source, arr)
+    }
+    let token: string
+    try { token = await this.getToken() } catch { /* token unavailable — drop, daemon recovers */ return }
+    await Promise.all([...byHourceSource.entries()].map(([source, hops]) =>
+      // daemonVersion lets the operator correlate spend / cache patterns with
+      // an agent-cli release in the Observability dashboard. One version per
+      // batch — daemons never upgrade mid-batch, so every hop in this group
+      // shares it on the server side.
+      runtimeBest(this.serverUrl, '/llm-calls', token, { source, hops, daemonVersion: CURRENT_VERSION }),
+    ))
+  }
+
+  stop(): void {
+    this.stopped = true
+    if (this.timer) { clearTimeout(this.timer); this.timer = null }
+    // Final flush — best-effort, fire-and-forget.
+    void this.flush()
+  }
+}
+
+/** CUMORA_ENGINE_MODEL value meaning "impose no model at all — use whatever
+ *  the local CLI is already configured for". */
+const ENGINE_MODEL_LOCAL = 'local'
+
+/** The model the LOCAL engine should run this agent's turns on.
+ *
+ *  BYOA wakes omit `--model` by default so the CLI/account uses its own
+ *  default. (Secure Codex deliberately ignores user config.) The daemon
+ *  discovery list leaves `agent.model` unset; `CUMORA_ENGINE_MODEL=local`
+ *  is the same no-pin path. A concrete `CUMORA_ENGINE_MODEL` still overrides.
+ *
+ *  Exported for tests. */
+export function resolveEngineModel(
+  configured: string | null | undefined,
+  override: string | undefined,
+): string | null {
+  const o = override?.trim()
+  if (!o) return modelIdOrNull(configured)
+  if (o.toLowerCase() === ENGINE_MODEL_LOCAL) return null
+  return modelIdOrNull(o)
+}
+
+/** The same knob governs the small-brain pin. `local` has to impose NOTHING:
+ *  otherwise ANTHROPIC_SMALL_FAST_MODEL would still name a model the custom
+ *  provider lacks, and the CLI's own quick calls would fail instead of the turn.
+ *  A concrete override only replaces the big-brain pin, so fast_model is left
+ *  alone there. */
+export function resolveEngineFastModel(
+  configured: string | null | undefined,
+  override: string | undefined,
+): string | null {
+  return override?.trim().toLowerCase() === ENGINE_MODEL_LOCAL ? null : modelIdOrNull(configured)
+}
+
+/** Resolve the actual classifier model. A member-specific small brain is more
+ * precise than the legacy computer-wide knob; `local` can still suppress the
+ * member pin through resolveEngineFastModel(). Exported for regression tests. */
+export function resolveTriageModel(
+  configured: string | null | undefined,
+  computerDefault: string | undefined,
+  engineOverride: string | undefined,
+): string | undefined {
+  return resolveEngineFastModel(configured, engineOverride)?.trim() || computerDefault?.trim() || undefined
+}
+
+export class AgentRunner {
+  /** Aborted once in stop(). Handed to every one-shot `adapter.run(...)` so the
+   *  engine child dies with its runner, the way the persistent session already
+   *  does. Without it those children were orphaned: they keep the `cumora` IPC
+   *  shim on PATH, so they go on posting AS the agent
+   *  while the replacement runner independently answers the same messages. */
+  private readonly teardown = new AbortController()
+  private token = ''
+  private tokenExpiresAt = 0
+  private home: string
+  private binDir: string
+  private trustedCliDir: string
+  private ipcDir: string
+  private readonly engine: EngineId
+  private readonly sessionStore: EngineSessionStore
+  private busy = false
+  private pendingRerun = false
+  // Triage-trouble backoff: when the small-brain triage is rate-limited OR
+  // fails (fail-open), we skip whole turns until this time, doubling each
+  // consecutive hit — so a broken/throttled triage can't be hammered every poll
+  // and (critically) can never escalate to the expensive big brain.
+  private triageBackoffUntil = 0
+  private triageTroubleStreak = 0
+  // Big-brain rate-limit cooldown: when the LAST attempt got
+  // "Server is temporarily limiting requests" from the provider, do not
+  // attempt another big-brain call from THIS agent until the cooldown
+  // expires. Without this, we'd re-attempt on every poll + SSE wake (each
+  // burning a real call against the same throttle that just rejected us)
+  // and the loop is visible to the user as 100+ rate-limit log lines and
+  // 30-65s end-to-end latency per turn. A signed-out engine earns the same
+  // treatment for longer, since retrying it cannot succeed at all. Assigned
+  // only by applyTurnBackoff(), from the outcome BOTH turn paths classify.
+  private engineBackoffUntil = 0
+  /** Why this agent is paused, for the skip log. A fifteen-minute operator
+   *  pause used to print as a rate-limit cooldown, which sends whoever is
+   *  reading the daemon log looking for a throttle that was never there. */
+  private engineBackoffWhy = 'rate limit'
+  private stopped = false
+  private lastWakeConvo: string | null = null
+  /** Synthetic work delivered with a wake has no durable chat row. Preserve it
+   *  across debounce/coalescing so a brief-only Kanban assignment can drive the
+   *  next turn instead of falling into the empty-inbox cost gate. */
+  private pendingBackgroundBrief: WakeBackgroundBrief | null = null
+  /** Pre-turn debounce timer (see WAKE_DEBOUNCE_MS). Non-null = a turn is already
+   *  scheduled to start shortly; further wakes fold into it instead of stacking. */
+  private wakeDebounceTimer: ReturnType<typeof setTimeout> | null = null
+  /** The engine session id to `--resume` next wake, so the agent keeps
+   *  continuous context (its place in a running task) instead of waking cold
+   *  on a frozen inbox snapshot. Captured from each run's stream-json output;
+   *  cleared if a resume fails so the next wake starts a clean session. */
+  private sessionId: string | null = null
+  /** Set when the persistent engine process proved unusable on this machine, so
+   *  the runner stops trying it and stays on the one-shot path. Without this a
+   *  process that starts and then fails every turn fails every turn forever;
+   *  with it, the worst case is exactly the pre-persistent behaviour. */
+  private persistentUnusable = false
+  /** The long-lived engine process (persistent stream-json for claude, app-server
+   *  thread for codex), created lazily and reused across wakes so turns 2..N skip
+   *  the cold start. Null = not yet started, dead (respawn next turn), or this
+   *  engine/config has no persistent mode (a custom args override). */
+  private engineSession: EngineSession | null = null
+  /** The currently awaited engine operation (persistent send or one-shot run).
+   * Runner replacement aborts/stops it and awaits this barrier before the next
+   * runner rewrites persona or standing-prompt files. */
+  private activeEngineRun: Promise<EngineRunResult> | null = null
+  private activeTriage: Promise<unknown> | null = null
+  /** When the last engine turn (chat OR agenda) finished — the "quiet" anchor for
+   *  agenda wakes, and the throttle for how often we check the board. */
+  private lastTurnEndedAt = 0
+  private lastAgendaCheckAt = 0
+  /** Same-turn steering state: a guard against concurrent steer checks, and the
+   *  last direct-message id we steered (so repeated wakes for it don't re-inject). */
+  private sideSteering = false
+  private lastSteeredMsgId: string | null = null
+  /** Content-free group-notice state (opt-in, see STEER_GROUP_IN_TURN): the last
+   *  group msg id we nudged about + when, so a fast room can't re-inject on every
+   *  message (throttled by GROUP_STEER_MIN_INTERVAL_MS). */
+  private lastGroupSteeredMsgId: string | null = null
+  private lastGroupSteerAt = 0
+  private pollTimer: ReturnType<typeof setInterval> | undefined
+  /** Per-turn steering budget (MAX_STEERS_PER_TURN / MAX_STEER_CHARS_PER_TURN).
+   *  Reset at every turn start, so each turn gets a fresh allowance; once spent,
+   *  further pings ride the coalesced rerun instead of being injected. */
+  private steerBudget: SteerBudget = {
+    steers: 0, chars: 0, maxSteers: MAX_STEERS_PER_TURN, maxChars: MAX_STEER_CHARS_PER_TURN,
+  }
+  /** Wake-stream liveness for fallbackPollDue: when the stream last showed
+   *  signs of life (connect, any event, any `: ping`); null while disconnected. */
+  private streamLastSeenAt: number | null = null
+  /** Aborts the current wake-stream fetch, so a stream that has gone silent can
+   *  be torn down and reconnected instead of waiting for TCP to notice. */
+  private streamAbort: AbortController | null = null
+  /** Last successful inbox check; 0 means a retry is due. */
+  private lastInboxDrainAt = 0
+  /** The last status POST that succeeded, and when — see AVAIL_REASSERT_MS. */
+  private lastPostedStatus: string | null = null
+  private lastPostedStatusAt = 0
+  private readonly adapter
+  /** Per-agent attachment cache. A long-lived instance lets cleanup protect
+   * paths used by the current turn and reap them when the runner stops. */
+  private readonly attachmentCache: AgentAttachmentCache
+  /** Privileged local broker: the engine sees only its IPC directory, while the
+   *  daemon keeps the short-lived runtime JWT in memory. */
+  private cliBroker: RuntimeCliBroker | null = null
+  /** Buffered ledger reporter — collects per-hop usage from the engine and
+   *  POSTs to /runtime/llm-calls so the universal llm_calls ledger sees BYOA
+   *  trajectory. Created lazily on first use. */
+  private hopReporter: HopReporter | null = null
+  /** runId of the run row currently in flight (chat or agenda). Hops emitted
+   *  during this turn carry it so the ledger can link them back to the run.
+   *  Cleared at turn end. */
+  private currentRunId: string | null = null
+
+  constructor(
+    private readonly cfg: DaemonConfig,
+    private readonly agent: AgentInfo,
+    engine: EngineId,
+    private readonly provider?: ProviderProfile,
+  ) {
+    this.engine = engine
+    this.home = join(AGENTS_ROOT, agent.id)
+    this.binDir = join(this.home, 'bin')
+    // The fixed MCP server runs outside the model sandbox. Its source and the
+    // sibling IPC shim therefore live outside the model-writable Agent home.
+    this.trustedCliDir = join(CONFIG_DIR, '.runtime-cli-tools', this.agent.id)
+    // Keep even the IPC parent outside the model-writable home. Secure Codex is
+    // granted only the two leaf request/response directories; Claude reaches
+    // them through the fixed MCP bridge, not a model-controlled shell.
+    this.ipcDir = join(CONFIG_DIR, '.runtime-cli-ipc', this.agent.id)
+    this.attachmentCache = new AgentAttachmentCache(
+      this.home,
+      this.cfg.serverUrl,
+      () => this.ensureToken(),
+    )
+    // The profile is a third dimension of session identity alongside agent and
+    // engine: a different endpoint/account owns a different transcript, so its
+    // session id must never be offered to another profile's provider.
+    this.sessionStore = new EngineSessionStore(SESSIONS_DIR, agent.id, engine,
+      engine === 'codex' ? CODEX_SESSION_SCOPE : providerProfileFingerprint(provider) || undefined)
+    this.adapter = getAdapter(engine)
+  }
+
+  private get reporter(): HopReporter {
+    if (!this.hopReporter) {
+      this.hopReporter = new HopReporter(this.cfg.serverUrl, async () => this.ensureToken())
+    }
+    return this.hopReporter
+  }
+
+  /** Map every adapter's raw EngineUsage → universal TokenUsage. Adapters
+   *  normalize their native counters into this Claude-shaped interface, so a
+   *  single ledger path covers every BYOA engine. */
+  private hopUsageOf(u: EngineUsage): TokenUsage {
+    return usageFromClaude(u as unknown as Record<string, unknown>)
+  }
+
+  /** Called by engine sessions/stream trackers for every provider hop. Pushes
+   *  one PendingHop into the batched
+   *  reporter; never throws. The engine's optional enrichment hints
+   *  (hopIndex/toolUses/textChars) ride along in `extras` — these are exactly
+   *  the columns the operator needs to ANSWER "why was this hop expensive?"
+   *  without having to pull the prompt body back. */
+  private onEngineHop(report: EngineHopReport, purpose: PendingHop['purpose']): void {
+    try {
+      const extras: Record<string, unknown> = {}
+      if (typeof report.hopIndex === 'number') extras.hopIndex = report.hopIndex
+      if (typeof report.toolUses === 'number') extras.toolUses = report.toolUses
+      if (typeof report.textChars === 'number') extras.textChars = report.textChars
+      this.reporter.push({
+        source: byoaSourceOf(this.adapter.id),
+        purpose,
+        runId: this.currentRunId,
+        conversationId: this.lastWakeConvo,
+        model: report.model,
+        usage: report.usage ? this.hopUsageOf(report.usage) : undefined,
+        latencyMs: report.latencyMs ?? 0,
+        status: 'ok',
+        extras: Object.keys(extras).length ? extras : undefined,
+      })
+    } catch (err) {
+      console.warn(`[computer] ${this.agent.id} hop report dropped:`, err instanceof Error ? err.message : err)
+    }
+  }
+
+  /** Is a turn currently in flight? (Used by the supervisor loop to avoid
+   *  restarting/auto-updating mid-turn.) */
+  get isBusy(): boolean { return this.busy }
+
+  /** Update the engine session id AND persist it to disk, so a daemon restart can
+   *  `--resume` the same session and recover the interrupted turn's context. */
+  private setSessionId(id: string | null): void {
+    if (id === this.sessionId) return
+    const previous = this.sessionId
+    this.sessionId = id
+    void this.sessionStore.save(id)
+    if (id) console.log(`[computer] ${this.agent.id} saved ${this.engine} session ${sessionIdPreview(id)}`)
+    else if (previous) console.log(`[computer] ${this.agent.id} cleared ${this.engine} session ${sessionIdPreview(previous)}`)
+  }
+
+  /** Defense in depth: the store and adapter are both fixed at construction.
+   * Refuse resume if a future refactor ever lets those bindings diverge. */
+  private resumeSessionId(): string | null {
+    if (this.engine === this.adapter.id && this.sessionStore.engine === this.engine) return this.sessionId
+    console.error(`[computer] ${this.agent.id} refused cross-engine resume: store=${this.sessionStore.engine}, runner=${this.engine}, adapter=${this.adapter.id}`)
+    return null
+  }
+
+  /** True when an engine error means the session is unusable and the NEXT wake
+   *  must start FRESH (no --resume). Two cases:
+   *   1. CONTEXT-WINDOW OVERFLOW — the persistent/resumed session has grown past
+   *      the model's window. Carrying it forward (--resume) just re-overflows on
+   *      every wake, so the agent stays wedged ("wake again" never helps) until
+   *      we drop it. This is hadResume-independent: even a single resumed session
+   *      that's now too big must be abandoned.
+   *   2. STALE / MISSING resume target — we tried to --resume a session the
+   *      engine no longer has. Only meaningful when we actually passed one, and
+   *      only when the engine SAYS SO: a mid-turn crash (OOM, sleep, provider
+   *      hangup) leaves a resumable session, so it must NOT reset — that would
+   *      discard the context the interrupted turn was building. */
+  private mustResetSession(err: string, hadResume: boolean): boolean {
+    if (this.isContextOverflow(err)) return true
+    if (this.isPoisonedTranscript(err)) return true
+    if (hadResume && isStaleResumeError(err)) return true
+    return false
+  }
+
+  private isContextOverflow(err: string): boolean {
+    return CONTEXT_OVERFLOW_RE.test(err)
+  }
+
+  private isPoisonedTranscript(err: string): boolean {
+    return POISONED_BODY_RE.test(err)
+  }
+
+  /** Human-readable reason for a forced session reset (just for the log). */
+  private resetReason(err: string): string {
+    if (this.isContextOverflow(err)) return 'engine hit its context-window limit'
+    if (this.isPoisonedTranscript(err)) return 'transcript poisoned by a malformed character (split emoji / lone surrogate)'
+    return 'engine session problem'
+  }
+
+  /** Drop the session id AND tear down any persistent engine process so the next
+   *  wake spawns a genuinely clean session (no --resume of the bad context). */
+  private async resetEngineSession(reason: string): Promise<void> {
+    console.warn(`[computer] ${this.agent.id} ${reason} — starting a FRESH engine session next wake`)
+    this.setSessionId(null)
+    await this.engineSession?.stop({ force: true })
+    this.engineSession = null
+  }
+
+  private async trackEngineRun(run: Promise<EngineRunResult>): Promise<EngineRunResult> {
+    this.activeEngineRun = run
+    try { return await run }
+    finally { if (this.activeEngineRun === run) this.activeEngineRun = null }
+  }
+
+  /** Execute exactly one engine attempt. Session capture and the persistent to
+   * one-shot transport fallback live here so chat and agenda cannot drift. */
+  private async runEngineAttempt(
+    delta: string,
+    resumeSessionId: string | null,
+    localImages: readonly string[] = [],
+  ): Promise<EngineRunResult> {
+    const session = this.ensureEngineSession(resumeSessionId)
+    const prompt = this.turnPrompt(session, delta)
+    const nativeImages = this.nativeImagePaths(localImages)
+    let result: EngineRunResult
+    if (session) {
+      const capture = setInterval(() => { if (session.sessionId) this.setSessionId(session.sessionId) }, 2000)
+      capture.unref?.()
+      try {
+        result = await this.trackEngineRun(session.send(prompt, nativeImages))
+      } finally {
+        clearInterval(capture)
+      }
+      if (session.sessionId) this.setSessionId(session.sessionId)
+      if (!session.alive) this.engineSession = null
+      const persistentFailure = engineFailureOf(result, !!resumeSessionId)
+      if (persistentFailure && !result.failure) result.failure = persistentFailure
+      // A dead persistent transport that never reached the model is safe to
+      // retry one-shot. Preserve the same resume target for continuity.
+      if (result.error && !result.usage && !session.alive && persistentFailure?.kind !== 'resume-not-found') {
+        this.persistentUnusable = true
+        this.engineSession = null
+        this.logEngineLine(`[engine] persistent session failed to produce a turn (${result.error.slice(0, 160)}) — falling back to one-shot for the rest of this process`)
+        result = await this.trackEngineRun(this.adapter.run({
+          runTool: (argv,signal) => this.invokeRuntimeCli(argv,signal),
+          home: this.home,
+          prompt: this.turnPrompt(null, delta),
+          env: this.engineEnv(),
+          model: this.engineModel(),
+          fastModel: this.engineFastModel(),
+          nativeFastMode: this.agent.nativeFastMode ?? false,
+          resumeSessionId,
+          vision: this.visionCapability(),
+          localImages: nativeImages,
+          onLog: (line) => this.logEngineLine(line),
+          onHopUsage: (r) => this.onEngineHop(r, 'agent-turn'),
+          signal: this.teardown.signal,
+        }))
+      }
+    } else {
+      result = await this.trackEngineRun(this.adapter.run({
+          runTool: (argv,signal) => this.invokeRuntimeCli(argv,signal),
+        home: this.home,
+        prompt,
+        env: this.engineEnv(),
+        model: this.engineModel(),
+        fastModel: this.engineFastModel(),
+        nativeFastMode: this.agent.nativeFastMode ?? false,
+        resumeSessionId,
+        vision: this.visionCapability(),
+        localImages: nativeImages,
+        onLog: (line) => this.logEngineLine(line),
+        onHopUsage: (r) => this.onEngineHop(r, 'agent-turn'),
+        signal: this.teardown.signal,
+      }))
+    }
+    if (result.sessionId) this.setSessionId(result.sessionId)
+    return result
+  }
+
+  /** A missing resume target proves the model never began the requested turn,
+   * so one fresh retry is safe. Every other failure returns immediately to
+   * avoid duplicating tool side effects after an ambiguous crash or timeout. */
+  private async runWithSessionRecovery(
+    delta: string,
+    localImages: readonly string[] = [],
+  ): Promise<EngineRunResult> {
+    const resumeSessionId = this.resumeSessionId()
+    return runWithSessionRecovery({
+      resumeSessionId,
+      run: (resume) => this.runEngineAttempt(delta, resume, localImages),
+      reset: () => this.resetEngineSession(`${this.engine} resume target ${sessionIdPreview(resumeSessionId ?? '')} does not exist`),
+      onFreshRetry: () => console.warn(`[computer] ${this.agent.id} retrying turn once with a fresh ${this.engine} session`),
+    })
+  }
+
+  private async loadSessionId(): Promise<void> {
+    await this.sessionStore.quarantineLegacy()
+    const s = await this.sessionStore.load()
+    if (s) {
+      this.sessionId = s
+      console.log(`[computer] ${this.agent.id} restored ${this.engine} session ${sessionIdPreview(s)} from disk — will --resume (continuity across restart)`)
+    }
+  }
+
+  async start(): Promise<void> {
+    await this.adapter.seedHome(this.home, { id: this.agent.id, name: this.agent.name, role: this.agent.role, systemPrompt: this.agent.systemPrompt })
+    if (allowUnsandboxedByoa()) await writeShim(this.binDir)
+    await writeShim(this.trustedCliDir)
+    // Versions before the broker stored a live bearer token beside the shim.
+    // Remove it before any new engine process can inspect the old home.
+    try {
+      const bin = await lstat(this.binDir)
+      if (!bin.isDirectory() || bin.isSymbolicLink()) {
+        throw new Error(`secure BYOA refuses linked legacy shim directory: ${this.binDir}`)
+      }
+      await rm(join(this.binDir, '.runtime-token'), { force: true })
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err
+    }
+    this.cliBroker = new RuntimeCliBroker(
+      this.ipcDir,
+      join(CONFIG_DIR, '.runtime-cli-broker', this.agent.id),
+      (argv, signal) => this.invokeRuntimeCli(argv, signal),
+    )
+    await this.cliBroker.start()
+    await this.loadSessionId()
+    void this.streamLoop()
+    // SSE-independent safety net (see INBOX_POLL_MS): tick every 20s, but only
+    // drain when the wake-stream can't be trusted (or the slow double-check is
+    // due), so a fleet of idle agents stops hammering /inbox in lockstep. Skip
+    // while busy so it never piles on the live turn.
+    this.pollTimer = setInterval(() => {
+      if (this.busy || this.stopped) return
+      const now = Date.now()
+      // A connected stream that has missed three pings is half-dead: tear it
+      // down so streamLoop reconnects (and its reconnect-catchup drains).
+      if (this.streamLastSeenAt !== null && now - this.streamLastSeenAt >= WAKE_STREAM_STALE_MS && this.streamAbort) {
+        console.warn(`[computer] ${this.agent.id} wake-stream silent for ${Math.round((now - this.streamLastSeenAt) / 1000)}s — reconnecting`)
+        this.streamAbort.abort()
+      }
+      if (fallbackPollDue({ now, streamLastSeenAt: this.streamLastSeenAt, lastInboxDrainAt: this.lastInboxDrainAt })) {
+        this.scheduleWake('poll')
+      }
+    }, INBOX_POLL_MS)
+  }
+
+  /** POST /status, skipping an idle `avail` the server already holds. Any other
+   *  status (thinking, resting…) always posts, and the avail right after it
+   *  posts too — only avail-after-avail is elided, and even that is re-asserted
+   *  every AVAIL_REASSERT_MS. A failed post is not remembered, so the next tick
+   *  retries it. */
+  private async postStatus(token: string, status: 'avail' | 'thinking'): Promise<void> {
+    const now = Date.now()
+    if (status === 'avail' && this.lastPostedStatus === 'avail' && now - this.lastPostedStatusAt < AVAIL_REASSERT_MS) return
+    const ok = await runtimeBest(this.cfg.serverUrl, '/status', token, { status })
+    if (ok) { this.lastPostedStatus = status; this.lastPostedStatusAt = now }
+    else this.lastPostedStatus = null
+  }
+
+  /** Phase 1 of shutdown: stop accepting NEW wakes/turns, but leave any in-flight
+   *  turn (and its engine child) running so a brief drain can let it finish. */
+  beginStop(): void {
+    this.stopped = true
+    if (this.pollTimer) { clearInterval(this.pollTimer); this.pollTimer = undefined }
+    this.streamAbort?.abort()
+    if (this.wakeDebounceTimer) { clearTimeout(this.wakeDebounceTimer); this.wakeDebounceTimer = null }
+  }
+
+  async stop(options: { forceEngine?: boolean; purgeAttachments?: boolean } = {}): Promise<void> {
+    this.beginStop()
+    const session = this.engineSession
+    this.engineSession = null
+    this.cliBroker?.stop()
+    this.cliBroker = null
+    // Kill a one-shot engine child too. sync() tears a runner down on any
+    // config change (engine/model/persona) or unassign while the daemon keeps
+    // running, which is exactly where an orphan does damage: it would still be
+    // acting with the OLD persona the operator just replaced.
+    this.teardown.abort()
+    // Drain any hops queued at shutdown so the ledger doesn't lose the tail
+    // (e.g. the agent was mid-turn when the daemon restarts for an update).
+    this.hopReporter?.stop()
+    this.hopReporter = null
+    await Promise.allSettled([
+      session?.stop({ force: options.forceEngine }) ?? Promise.resolve(),
+      this.activeEngineRun ?? Promise.resolve(),
+      this.activeTriage ?? Promise.resolve(),
+    ])
+    await this.attachmentCache.dispose({ purge: options.purgeAttachments === true }).catch((error) => {
+      console.warn(`[computer] ${this.agent.id} attachment cache cleanup failed`, error)
+    })
+    await this.sessionStore.flush()
+  }
+
+  /** Does this runner's live config still match the latest server state? The
+   *  engine + model + persona are captured at construction (the adapter is
+   *  fixed, and seedHome runs once in start()), so when any of them changes in
+   *  Cumora, sync() must tear this runner down and build a fresh one — otherwise
+   *  e.g. a Claude→Codex switch wouldn't take effect until a daemon restart. */
+  configMatches(agent: AgentInfo, engine: EngineId, provider?: ProviderProfile): boolean {
+    return this.adapter.id === engine
+      && providerProfileFingerprint(this.provider) === providerProfileFingerprint(provider)
+      && this.agent.name === agent.name
+      && this.agent.role === agent.role
+      && this.agent.systemPrompt === agent.systemPrompt
+      && this.agent.model === agent.model
+      && this.agent.fastModel === agent.fastModel
+      && (this.agent.nativeFastMode ?? false) === (agent.nativeFastMode ?? false)
+  }
+
+  private async ensureToken(signal?: AbortSignal): Promise<string> {
+    if (this.token && Date.now() < this.tokenExpiresAt - TOKEN_REFRESH_SKEW_MS) return this.token
+    const minted = await api<{ token: string; expiresInSeconds: number }>(
+      this.cfg.serverUrl, `/api/agents/${this.agent.id}/runtime-token`,
+      { method: 'POST', headers: { Authorization: `Bearer ${this.cfg.deviceToken}` }, body: JSON.stringify({ providerProfile: this.agent.providerProfile ?? null }), signal },
+    )
+    this.token = minted.token
+    this.tokenExpiresAt = Date.now() + minted.expiresInSeconds * 1000
+    return this.token
+  }
+
+  private invalidateToken(token: string): void {
+    // Do not erase a newer token if an older in-flight request finishes late.
+    if (this.token !== token) return
+    this.token = ''
+    this.tokenExpiresAt = 0
+  }
+
+  /** Execute one shim request outside the model's sandbox. The broker accepts
+   *  only argv strings; identity, URL, Authorization, redirects, and token
+   *  refresh remain daemon-owned and cannot be changed by the model. */
+  private async invokeRuntimeCli(argv: string[], lifecycleSignal: AbortSignal): Promise<RuntimeCliBrokerResult> {
+    const requestAbort = new AbortController()
+    const timeout = setTimeout(() => requestAbort.abort(), HTTP_TIMEOUT_MS)
+    const onLifecycleAbort = () => requestAbort.abort()
+    if (lifecycleSignal.aborted) requestAbort.abort()
+    else lifecycleSignal.addEventListener('abort', onLifecycleAbort, { once: true })
+    try {
+      const token = await this.ensureToken(requestAbort.signal)
+      if (requestAbort.signal.aborted) return { exitCode: 70, error: 'runtime IPC request cancelled' }
+      const res = await fetch(`${this.cfg.serverUrl}/runtime/cli`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ argv }),
+        signal: requestAbort.signal,
+      })
+      if (!res.ok) {
+        if (res.status === 401 || res.status === 403) this.invalidateToken(token)
+        const body = await res.text().catch(() => '')
+        return { exitCode: 70, error: `HTTP ${res.status} ${body.slice(0, 200)}`.trim() }
+      }
+      const data = await res.json() as { text?: unknown; exitCode?: unknown; attachmentReads?: unknown }
+      let text = typeof data.text === 'string' ? data.text : ''
+      const reads = runtimeCliAttachmentReads(data.attachmentReads)
+      const cachedByMessage = new Map<string, AttachmentCacheResult>()
+      if (reads.length > 0) {
+        for (const read of reads) {
+          cachedByMessage.set(read.messageId, await this.attachmentCache.materialize(read.messageId, read.attachments))
+        }
+        const trimmed = text.trimStart()
+        const enriched = trimmed.startsWith('{') || trimmed.startsWith('[')
+          ? enrichCliJsonWithAttachmentPaths(text, cachedByMessage, this.visionCapability())
+          : null
+        if (enriched !== null) {
+          text = enriched
+        } else if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+          console.warn(`[computer] ${this.agent.id} CLI returned unparseable JSON with attachments`)
+        } else {
+          const blocks = [...cachedByMessage.entries()]
+            .map(([messageId, cached]) =>
+              `Message ${messageId}:\n${renderCachedAttachments(cached, this.visionCapability())}`)
+            .filter((block) => block.trim().length > 0)
+          if (blocks.length > 0) text += `\n\nAttachment files cached in your Agent home:\n${blocks.join('\n\n')}`
+        }
+      }
+      return {
+        text,
+        exitCode: typeof data.exitCode === 'number' ? data.exitCode : 0,
+      }
+    } catch (err) {
+      return { exitCode: 70, error: err instanceof Error ? err.message : String(err) }
+    } finally {
+      clearTimeout(timeout)
+      lifecycleSignal.removeEventListener('abort', onLifecycleAbort)
+    }
+  }
+
+  /** Env handed to the engine subprocess. Secure mode preserves the operator's
+   *  original PATH so model-writable <home>/bin cannot shadow the engine binary;
+   *  compatibility mode alone exposes its legacy CLI shim there. No server URL
+   *  or bearer token crosses the model-process boundary. */
+  /** Big-brain model for the local engine, after the CUMORA_ENGINE_MODEL escape. */
+  private engineModel(): string | null {
+    if (this.provider) return this.agent.model || this.provider.model
+    return resolveEngineModel(this.agent.model, process.env.CUMORA_ENGINE_MODEL)
+  }
+
+  /** Small/fast-brain model for the local engine, after the same escape. */
+  private engineFastModel(): string | null {
+    if (this.provider) return this.agent.fastModel || this.provider.fastModel
+    return resolveEngineFastModel(this.agent.fastModel, process.env.CUMORA_ENGINE_MODEL)
+  }
+
+  /** Per-agent small brain wins over the computer-wide compatibility knob.
+   * This makes participants.fast_model real for every adapter whose classify()
+   * already accepts a model, while preserving CUMORA_TRIAGE_MODEL as a fallback
+   * for old deployments and engines left on their default. */
+  private triageModelPin(): string | undefined {
+    if (this.provider) return this.agent.fastModel || this.provider.fastModel
+    return resolveTriageModel(this.agent.fastModel, process.env.CUMORA_TRIAGE_MODEL, process.env.CUMORA_ENGINE_MODEL)
+  }
+
+  private engineEnv(): NodeJS.ProcessEnv {
+    const env = {
+      ...process.env,
+      PATH: engineProcessPath(this.binDir),
+      CUMORA_AGENT_IPC_DIR: this.ipcDir,
+      CUMORA_AGENT_MCP_SHIM: join(this.trustedCliDir, 'cumora-mcp'),
+      CUMORA_AGENT_ID: this.agent.id,
+    }
+    if(this.engine==='api') return {...env,CUMORA_API_PROFILE_ID:this.provider?.id}
+    return this.provider ? providerProfileEnv(env, this.provider) : env
+  }
+
+  /** The long-lived engine process for this agent (persistent stream-json),
+   *  created lazily and reused across wakes so turns 2..N skip the cold start.
+   *  Returns null if the engine has no persistent mode (Cursor/OpenCode, Codex
+   *  fallback, or custom args) — the caller then uses one-shot run(). If the
+   *  prior process has died it respawns, resuming this.sessionId so context
+   *  carries across the restart. */
+  private ensureEngineSession(resumeSessionId = this.resumeSessionId()): EngineSession | null {
+    if (this.stopped) return null
+    if (!this.adapter.startSession) return null
+    if (this.persistentUnusable) return null
+    if (this.engineSession?.alive) return this.engineSession
+    this.engineSession = this.adapter.startSession({
+      home: this.home,
+      env: this.engineEnv(),
+      model: this.engineModel(),
+      fastModel: this.engineFastModel(),
+      nativeFastMode: this.agent.nativeFastMode ?? false,
+      resumeSessionId,
+      standingPrompt: this.standingPrompt(),
+      vision: this.visionCapability(),
+      onLog: (line) => this.logEngineLine(line),
+      // Trajectory hook — every assistant hop (Claude) / turn-completed (Codex)
+      // shows up here and gets batched to the universal ledger. Purpose is
+      // 'agent-turn' for ALL session-issued hops; triage / agenda / etc. ride
+      // their own purpose-tagged paths (see recordTriageUsage etc.).
+      onHopUsage: (r) => this.onEngineHop(r, 'agent-turn'),
+    })
+    if (this.engineSession) {
+      console.log(`[computer] ${this.agent.id} engine session ${this.sessionId ? `respawned (resume ${this.sessionId.slice(0, 8)})` : 'spawned fresh'} — persistent, no per-wake cold start`)
+    }
+    return this.engineSession
+  }
+
+  /** Enter, or clear, this agent's engine pause for a finished turn. Both turn
+   *  paths call this and nothing else assigns engineBackoffUntil, so the chat
+   *  wake and the agenda heartbeat cannot drift apart again. */
+  private applyTurnBackoff(outcome: TurnOutcome): void {
+    const until = backoffUntilFor(outcome, Date.now())
+    if (until === null) return
+    this.engineBackoffUntil = until
+    this.engineBackoffWhy = outcome === 'operator-fix' ? 'operator action needed' : 'rate limit'
+  }
+
+  private visibleEngineError(exitCode: number, detail?: string): string {
+    const raw = conciseError(redactProviderSecret(detail || `process exited with code ${exitCode}`, this.provider))
+    const redacted = raw
+      .split(this.home).join('<agent home>')
+      .split(homedir()).join('~')
+    return `local ${this.adapter.id} failed (exit ${exitCode}): ${redacted}`
+  }
+
+  /** Keep a long engine turn alive: bump the run's updated_at every RUN_HEARTBEAT_MS
+   *  so the server's 10-min stale-run sweeper doesn't reap a legitimately long turn
+   *  as "orphaned". Fires once immediately, then on an interval. Returns a stop fn
+   *  for the turn's finally block. No-op (and no timer) when there's no run id. */
+  private beatRun(token: string, runId: string | undefined): () => void {
+    if (!runId) return () => { /* nothing to heartbeat */ }
+    const beat = (): void => { void runtimeBest(this.cfg.serverUrl, `/runs/${runId}/heartbeat`, token, {}) }
+    beat()
+    const timer = setInterval(beat, RUN_HEARTBEAT_MS)
+    return () => clearInterval(timer)
+  }
+
+  private async publishEngineFailure(args: {
+    token: string
+    runId?: string
+    conversationId: string | null
+    error: string
+    exitCode: number
+  }): Promise<void> {
+    if (args.runId) {
+      await runtimeBest(this.cfg.serverUrl, '/events', args.token, {
+        runId: args.runId,
+        kind: 'engine.failed',
+        level: 'error',
+        title: `${this.adapter.id} exited ${args.exitCode}`,
+        data: { error: args.error },
+        stage: 'failed',
+      })
+    }
+    const hint = authFailureHint(this.adapter.id, args.error)
+    const conversationIds = await failureConversationIds(this.cfg.serverUrl, args.token, args.conversationId)
+    await Promise.all(conversationIds.map((conversationId) => runtimeBest(this.cfg.serverUrl, '/notices', args.token, {
+      conversationId,
+      agentId: this.agent.id,
+      noticeKind: 'byoa_engine_failed',
+      text: this.adapter.id==='api' ? `${this.agent.name} 暂时无法回复：${args.error}\n${hint}` : /Endpoint is unavailable/i.test(args.error)
+        ? `${this.agent.name} 暂时无法回复：${hint}`
+        : `${this.agent.name} could not run on local ${this.adapter.id}: ${args.error}\n${hint}`,
+      dedupeKey: `byoa_engine_failed:${this.agent.id}:${conversationId}:${hashText(args.error)}`,
+      dedupeTtlSec: 900,
+    })))
+  }
+
+  /** Preload global + current-project memory indexes. Existing
+   *  `memory/MEMORY.md` stays GLOBAL; project work lives under
+   *  `memory/projects/<id>/MEMORY.md`. A no-project wake injects global
+   *  only — same contract as cloud `loadMemory`. */
+  private async memoryDigest(projectIds: readonly string[] = []): Promise<string> {
+    const parts: Array<{ label: string; body: string }> = []
+    for (const rel of memoryIndexPathsForScope(projectIds)) {
+      try {
+        const txt = (await readFile(join(this.home, rel), 'utf8')).trim()
+        if (txt) parts.push({ label: rel, body: txt })
+      } catch { /* missing index is fine */ }
+    }
+    return composeMemoryDigest(parts)
+  }
+
+  /** Triage the inbox on the LOCAL small brain. The whole point of BYOA is that
+   *  judgment runs on the operator's OWN machine — so the cerebellum is the
+   *  engine's cheap fast model (Claude Haiku), NOT a cloud call. The server only
+   *  builds the prompt (it has the DB for inbox+context); inference is 100%
+   *  local: no network model hop, no sub2api quota (429/503), no big brain. */
+  private async inboxTriage(token: string): Promise<RuntimeInboxTriageResponse | null> {
+    const payload = await runtimeGet<RuntimeTriagePayload>(this.cfg.serverUrl, '/inbox-triage/payload', token)
+    if (!payload) return null
+    if (payload.verdict) return payload.verdict // hard rule / empty inbox — no model needed
+    if (!payload.instructions || !payload.input) return null
+    // No per-engine "skip triage" escape hatch. It looked like a win (dodge one
+    // cold CLI spawn per wake) but triage is NOT on the reply critical path:
+    // triage-core answers human DMs/groups deterministically without a model,
+    // and the small brain runs on the local cheap model. The escape hatch only
+    // made one engine judge its own inbox instead of using the shared gate.
+
+    // Triage concurrency gate + deterministic spawn pacer. Pacer is shared
+    // with the big-brain path (same Anthropic/OpenAI account quota, same
+    // local CLI process pool) — every spawn waits its turn so the provider
+    // never sees a burst of N simultaneous starts. See SpawnPacer doc.
+    await triageSem.acquire()
+    await spawnPacer.gate()
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), TRIAGE_TIMEOUT_MS)
+    const onStop = () => controller.abort(this.teardown.signal.reason)
+    this.teardown.signal.addEventListener('abort', onStop, { once: true })
+    let res: { text: string; error?: string; usage?: EngineUsage; model?: string | null }
+    try {
+      await mkdir(TRIAGE_DIR, { recursive: true })
+      this.teardown.signal.throwIfAborted()
+      const pending = this.adapter.classify({
+        cwd: TRIAGE_DIR,
+        prompt: `${payload.instructions}\n\n${payload.input}`,
+        env: this.engineEnv(),
+        // Agent-specific small brain first; computer-wide override second; then
+        // the adapter chooses its own cheap/default model.
+        model: this.triageModelPin(),
+        signal: controller.signal,
+      })
+      this.activeTriage = pending
+      res = await pending
+    } catch (err) {
+      res = { text: '', error: err instanceof Error ? err.message : String(err) }
+    } finally {
+      clearTimeout(timer)
+      triageSem.release()
+      this.activeTriage = null
+      this.teardown.signal.removeEventListener('abort', onStop)
+    }
+
+    res.text = redactProviderSecret(res.text, this.provider)
+    if (res.error) res.error = redactProviderSecret(res.error, this.provider)
+    if (res.error || !res.text.trim()) {
+      const errText = res.error ?? 'no output'
+      // CRITICAL: a rate-limited small model must NOT fail-open. Fail-open wakes
+      // the expensive big brain to "decide" — which on a 429/quota/overload just
+      // burns more of the user's quota and trips the big brain's own limit too
+      // (the runaway that drained accounts). Fail CLOSED: skip, don't wake the
+      // engine, don't ack — the caller backs off and retries when the limit lifts.
+      // A TIMEOUT counts too: a triage that runs past the ceiling is almost always
+      // the engine retrying a throttled provider, so treat it as a back-off signal
+      // rather than fail-open into the big brain.
+      if (controller.signal.aborted || isRateLimited(errText)) {
+        console.warn(`[computer] ${this.agent.id} local triage RATE-LIMITED${controller.signal.aborted ? ' (timed out)' : ''} — backing off, NOT waking the big brain: ${errText.slice(0, 160)}`)
+        return {
+          actionable: false,
+          reason: `triage rate-limited (${errText.slice(0, 120)}); backing off`,
+          promptNote: '',
+          source: 'rate-limited',
+        }
+      }
+      if (payload.failClosed) {
+        // Purely agent-to-agent wake: a flaky local model must NOT fail open, or
+        // every triage error wakes the big brain and amplifies the very loop the
+        // gate exists to stop. A missed agent↔agent reply is cheap and self-heals
+        // on the next real event.
+        console.warn(`[computer] ${this.agent.id} local triage failed: ${errText.slice(0, 200)} — fail CLOSED (agent-only, no human waiting)`)
+        return {
+          actionable: false,
+          reason: `local triage failed (${errText.slice(0, 120)}); fail closed (agent-only)`,
+          promptNote: '',
+          source: 'fail-closed',
+        }
+      }
+      console.warn(`[computer] ${this.agent.id} local triage failed: ${errText.slice(0, 200)} — fail open`)
+      return {
+        actionable: true,
+        reason: `local triage failed (${errText.slice(0, 120)}); fail open`,
+        promptNote:
+          'Local small-brain triage failed; read the inbox/context yourself and respond only if a human needs you. ' +
+          'Do not silently ack unread human messages unless the thread clearly shows they are irrelevant or already handled.',
+        source: 'fail-open',
+      }
+    }
+    const parsed = parseTriage(res.text)
+    // A valid "don't reply" verdict (actionable:false) legitimately has no
+    // promptNote — accept it so the gate actually gates. Only a verdict we
+    // couldn't even recover `actionable` from (parsed === null) fails open.
+    if (parsed) {
+      const verdict = finalizeTriage(parsed, 'support-model-local')
+      // Record the gate's cache-aware cost (fire-and-forget). A BYOA triage runs
+      // LOCAL + cold-session — its input is uncached, the cost this ledger exists
+      // to weigh. usage is present for Claude, Cursor, and OpenCode; absent for
+      // the current Codex/Grok one-shot classifiers.
+      void this.recordTriageUsage(token, verdict.actionable, verdict.reason, res.usage, res.model)
+      return verdict
+    }
+    if (payload.failClosed) {
+      console.warn(`[computer] ${this.agent.id} local triage unparseable: ${res.text.slice(0, 200)} — fail CLOSED (agent-only, no human waiting)`)
+      return {
+        actionable: false,
+        reason: 'local triage produced no usable verdict; fail closed (agent-only)',
+        promptNote: '',
+        source: 'fail-closed',
+      }
+    }
+    console.warn(`[computer] ${this.agent.id} local triage unparseable: ${res.text.slice(0, 200)} — fail open`)
+    return {
+      actionable: true,
+      reason: 'local triage produced no usable verdict; fail open',
+      promptNote: 'Local small-brain triage gave no clear verdict; read the inbox/context yourself and respond only if a human needs you.',
+      source: 'fail-open',
+    }
+  }
+
+  /** Triage model id for pricing, honoring the agent pin then CUMORA_TRIAGE_MODEL. Cursor,
+   *  OpenCode, pi and Antigravity have no universal cheap alias, so a reported/pinned stream
+   *  model wins and the agent model is only a fallback. */
+  private triageModel(): string {
+    const pinned = this.triageModelPin()
+    if (pinned) return pinned
+    if (this.adapter.id === 'claude') return 'haiku'
+    if (this.adapter.id === 'grok') return 'grok-4.5'
+    if (this.adapter.id === 'codex') {
+      const provider = cachedCodexProvider(this.engineEnv())
+      return provider?.prefersLocalDefault ? provider.defaultModel ?? '<codex-default>' : 'gpt-5.4-mini'
+    }
+    if (this.adapter.id === 'gemini') return 'gemini-2.5-flash-lite'
+    if (this.adapter.id === 'qwen') return 'qwen3-coder-flash'
+    if (this.adapter.id === 'opencode') return this.agent.model ?? '<opencode-default>'
+    if (this.adapter.id === 'pi') return this.agent.model ?? '<pi-default>'
+    if (this.adapter.id === 'antigravity') return this.agent.model ?? 'gemini-3.8-flash-high'
+    if (this.adapter.id === 'zcode') return this.agent.model ?? '<zcode-default>'
+    if (this.adapter.id === 'maka') return '<maka-default>'
+    if (this.adapter.id === 'omp') return this.agent.model ?? '<omp-default>'
+    if (this.adapter.id === 'cursor') return this.agent.model ?? '<cursor-default>'
+    return this.agent.model ?? '<cursor-default>'
+  }
+
+  /** Post one local-triage record to the cost ledger. Best-effort. */
+  private async recordTriageUsage(token: string, actionable: boolean, reason: string, usage?: EngineUsage, model?: string | null): Promise<void> {
+    await runtimeBest(this.cfg.serverUrl, '/triage', token, {
+      source: `byoa-${this.adapter.id}`,
+      model: model || this.triageModel(),
+      actionable,
+      reason,
+      usage: usage ? usageFromClaude(usage) : null,
+      // Mirror the hop reporter — every BYOA-emitted row in llm_calls carries
+      // the daemon version that produced it.
+      daemonVersion: CURRENT_VERSION,
+    })
+  }
+
+  /** Snapshot the unread inbox: the {conversationId → latest unread message id}
+   *  cursor map (for `ackSeen`), AND a human-readable digest of the unread
+   *  messages to PRE-LOAD into the wake prompt. Pre-loading is what the cloud
+   *  agent already does (it builds the turn input from the inbox), so the BYOA
+   *  engine can read the room and reply WITHOUT first spending `cumora inbox` +
+   *  `cumora messages` round-trips — each of those is an extra opus hop, and
+   *  cutting them is most of the per-turn latency.
+   *  Captured BEFORE the engine runs so `ackSeen` advances exactly what THIS
+   *  turn saw; messages that land mid-turn keep a higher id, stay unread, and
+   *  drive the coalesced rerun. */
+  /** Parse a system row's wire payload as a due calendar alarm (the JSON the
+   *  server's calendar dispatcher writes). Wire-format read, not content
+   *  classification. Null = not a calendar dispatch. */
+  private parseAlarmPayload(raw: string): { assigneeId?: string; title?: string; agentPrompt?: string } | null {
+    try {
+      const p = JSON.parse(raw) as { kind?: unknown; assigneeId?: unknown; title?: unknown; agentPrompt?: unknown }
+      if (p?.kind !== 'calendar_event') return null
+      return {
+        assigneeId: typeof p.assigneeId === 'string' ? p.assigneeId : undefined,
+        title: typeof p.title === 'string' ? p.title : undefined,
+        agentPrompt: typeof p.agentPrompt === 'string' ? p.agentPrompt : undefined,
+      }
+    } catch { return null }
+  }
+
+  private async snapshotUnread(token: string): Promise<{ seen: Map<string, string>; digest: string; hasReal: boolean; projectIds: string[]; imagePaths: string[]; videoMessages: Array<{ messageId: string; conversationId: string }> }> {
+    const inbox = await runtimeGet<RuntimeInboxResponse>(this.cfg.serverUrl, '/inbox', token)
+    this.lastInboxDrainAt = inbox ? Date.now() : 0
+    if (!inbox) throw new Error('inbox fetch failed')
+    const seen = new Map<string, string>()
+    // Unread grouped BY CONVERSATION (first-seen order), each with the header
+    // (title + topic) the cloud agent's context also carries — so a BYOA agent
+    // always sees what the group is FOR (its topic), not just the messages.
+    // Grouped rather than one flat line list because the digest has a LINE
+    // BUDGET, and spending it per conversation is what stops a busy room from
+    // evicting — and `ackSeen` then burying — a quiet one. See renderInboxDigest.
+    const byConvo = new Map<string, InboxDigestConversation>()
+    // `hasReal` = is ANY unread a genuine human/agent message (not a system
+    // relay/status/membership notice)? The cost gate in runTurn uses this to
+    // refuse to spend ANY model on a system-only (or empty) inbox.
+    let hasReal = false
+    // rows are ordered created_at ASC, so the last row per conversation is its
+    // newest unread message — exactly the cursor we want to advance to.
+    for (const row of inbox?.rows ?? []) {
+      if (typeof row.conversation_id !== 'string' || !row.conversation_id) continue
+      if (typeof row.id === 'string' && row.id) seen.set(row.conversation_id, row.id)
+      // A due CALENDAR dispatch is a SELF-SCHEDULED ALARM, not system noise —
+      // it must count as real or a BYOA agent's own alarm can never wake its
+      // engine (the cloud path special-cases these system rows the same way).
+      const alarm = row.kind === 'system' && typeof row.body === 'string' ? this.parseAlarmPayload(row.body) : null
+      if (row.kind !== 'system' || (alarm && (!alarm.assigneeId || alarm.assigneeId === this.agent.id))) hasReal = true
+      let convo = byConvo.get(row.conversation_id)
+      if (!convo) {
+        const head = conversationHeader({
+          conversation_id: row.conversation_id,
+          conversation_kind: row.conversation_kind,
+          conversation_title: row.conversation_title,
+          conversation_topic: row.conversation_topic,
+          project_name: row.project_name,
+        })
+        convo = { head, msgs: [], ids: [] }
+        byConvo.set(row.conversation_id, convo)
+      }
+      const author = row.author_name ?? 'someone'
+      const who = row.author_kind ? `${author} (${row.author_kind})` : author
+      // Render a due calendar alarm readably (title — prompt) so the engine
+      // knows WHY it woke; other system rows stay redacted as before.
+      const body = (row.kind === 'system'
+        ? (alarm ? `[calendar:due] ${[alarm.title, alarm.agentPrompt].filter(Boolean).join(' — ') || 'scheduled alarm fired'}` : '[system]')
+        : (row.body ?? '')).replace(/\s+/g, ' ').slice(0, 600)
+      // Keep the message id + convo id on each line (like the cloud agent's
+      // context) so the engine can QUOTE the exact message: `cumora reply
+      // <convo> '<body>' --quote <message_id>`.
+      convo.msgs.push(`  [${row.id}] ${row.conversation_id}  ${who}: ${body}${attachmentNotes(row.attachments ?? row.attachment)}`)
+      if (row.id) convo.ids?.push(row.id)
+    }
+    const attachmentBlocks: string[] = []
+    const imagePaths: string[] = []
+    const visibleMessageIds = visibleInboxMessageIds(byConvo)
+    for (const row of inbox.rows ?? []) {
+      if (!row.id || !visibleMessageIds.has(row.id)) continue
+      const descriptors = normalizeAttachments(row.attachments ?? row.attachment)
+      if (descriptors.length === 0) continue
+      const cached = await this.attachmentCache.materialize(row.id, descriptors)
+      for (const file of cached.files) {
+        if (isImageAttachment(file.attachment)) imagePaths.push(file.path)
+      }
+      const block = renderCachedAttachments(cached, this.visionCapability())
+      if (block) attachmentBlocks.push(`Message ${row.id}:\n${block}`)
+    }
+    const projectIds = uniqueProjectIds(
+      (inbox?.rows ?? []).map((r) => (typeof r.project_id === 'string' ? r.project_id : null)),
+    )
+    const digest = renderInboxDigest(byConvo)
+    return {
+      seen,
+      digest: `${digest}${attachmentBlocks.length ? `\n\nAttachment files cached in your Agent home:\n${attachmentBlocks.join('\n\n')}` : ''}`,
+      hasReal,
+      projectIds,
+      imagePaths: [...new Set(imagePaths)],
+      videoMessages: videoMessageReferences(inbox.rows ?? [], visibleMessageIds),
+    }
+  }
+
+  private visionCapability(): 'supported' | 'unsupported' | 'unknown' {
+    return engineVisionCapability(this.agent.modelCatalog, this.engineModel())
+  }
+
+  /** Only Codex has a verified native path-input contract in this daemon. Keep
+   * the capability gate here so an unknown or non-visual model still receives
+   * the textual path and honest guidance, never an unsupported image request. */
+  private nativeImagePaths(paths: readonly string[]): readonly string[] {
+    if(this.engine==='api') return this.visionCapability()==='unsupported' ? [] : paths
+    if (this.engine !== 'codex' || this.visionCapability() !== 'supported') return []
+    return [...new Set(paths.filter((path) => path.length > 0 && isAbsolute(path)))]
+  }
+
+  /** Advance this agent's read cursor over the conversations it just saw, so a
+   *  wake that ends WITHOUT a reply (small-brain said "skip", or the engine
+   *  read the room and chose silence) does not re-trigger on the same messages
+   *  every INBOX_POLL_MS. markConversationRead is monotonic, so this never
+   *  regresses a cursor the engine already advanced further via `cumora reply`. */
+  private async ackSeen(token: string, seen: Map<string, string>): Promise<void> {
+    if (seen.size === 0) return
+    await Promise.all([...seen].map(([conversationId, upToMessageId]) =>
+      runtimeBest(this.cfg.serverUrl, '/conversation/mark-read', token, { conversationId, upToMessageId }),
+    ))
+  }
+
+  /** Log an engine stream-json line, dropping the high-volume noise that
+   *  floods the console without telling us anything: per-spawn SessionStart
+   *  hook chatter (started/response × N hooks) and rate-limit keepalives. We
+   *  keep the signal — assistant text, tool calls/results, init, errors. */
+  private logEngineLine(line: string): void {
+    line = redactProviderSecret(line, this.provider)
+    if (line.includes('"hook_started"') || line.includes('"hook_response"') || line.includes('"rate_limit_event"')) return
+    console.log(`[${this.agent.id}/${this.adapter.id}] ${line.slice(0, 500)}`)
+  }
+
+  private formatTriageNote(triage: RuntimeInboxTriageResponse | null): string {
+    if (!triage) return ''
+    const note = typeof triage?.promptNote === 'string' ? triage.promptNote.trim() : ''
+    if (!note) return ''
+    const state = triage.actionable === false ? 'not relevant' : 'relevant'
+    const source = typeof triage.source === 'string' ? triage.source : 'server'
+    const reason = typeof triage.reason === 'string' && triage.reason.trim()
+      ? `\nReason: ${triage.reason.trim().slice(0, 500)}`
+      : ''
+    return `Small-brain inbox triage (${state}, ${source}): ${note}${reason}`
+  }
+
+  /** The INVARIANT operational scaffold — identical every turn. It goes into the
+   *  engine's system prompt ONCE per session (Claude: `--append-system-prompt-file`)
+   *  instead of being re-sent in every turn's message. THAT is what keeps the
+   *  transcript small enough that the engine's NATIVE auto-compaction keeps up.
+   *  Engines without a system-prompt file get this
+   *  inlined into each turn instead (see the turn paths). Covers BOTH chat and
+   *  agenda turns; the per-turn deltas (chatDelta / agendaDelta) carry only the
+   *  dynamic bits. No game-specific rules — the engine coordinates in-turn via the
+   *  shared glance-yield protocol, exactly like the cloud pod-agent. */
+  /** Which calling convention this agent's turns actually have. */
+  private promptSurface(): ActionSurface {
+    return actionSurfaceFor(allowUnsandboxedByoa())
+  }
+
+  private standingPrompt(): string {
+    if(this.engine==='api') return `You are ${this.agent.name} (id: ${this.agent.id}), a Cumora teammate. Role: ${this.agent.role??''}. Follow your current persona and the latest messages. Use mcp__cumora__cli with literal argv arrays to read messages, glance before replying, reply, react, and use memory remember/recall. No shell or local files. Use help to discover exact syntax. Read the relevant conversation before responding. After a successful final reply, end your turn without restating it. ` + GLANCE_YIELD_RULES + '\n' + DISCUSSION_STYLE_RULES + '\n' + postingMechanicsText('mcp')
+
+    // RESTORED to the 5/28T22:17Z baseline SHAPE: one minimal prompt of essential
+    // mechanics, with GLANCE_YIELD_RULES and a few core sections — NOT a wall of
+    // ── XXX ── sections (that's the bloat the user called out: AGENT_VOICE_RULES
+    // priming, MORE CUMORA COMMANDS, HELD REPLY explainer, CONTEXT COMPACTION,
+    // WORKING A BOARD CARD — none of those existed at 5/28 when coord was perfect,
+    // ergo none of them are required for coord). The agent discovers other CLI
+    // surface via `cumora <cmd> --help` when it needs it.
+    return (
+      `You are a Cumora teammate — a first-class member of this team with your own voice. ` +
+      actionSurfaceText(this.promptSurface()) +
+      `Read the relevant thread and respond appropriately, in your own voice — like a real teammate. ` +
+      `In a group, you may be the first person woken or joining after a peer has replied, so ` +
+      `coordinate via the protocol below — in short: post the real next item from what's ACTUALLY been posted, ` +
+      `optimistically; the server HOLDs you and shows the newer messages if a peer moved the room while you composed.\n` +
+      // The shared glance-and-yield protocol — verbatim via the const so BYOA
+      // coordinates identically to the cloud pod-agent.
+      GLANCE_YIELD_RULES + `\n\n` +
+      DISCUSSION_STYLE_RULES + `\n\n` +
+      postingMechanicsText(this.promptSurface()) +
+      `After your work is complete and your final \`cumora reply\` returns success, end the turn. ` +
+      `Do NOT restate it, summarise it, or narrate what you just did. ` +
+      `A progress update or a brief reply to a mid-task ping does not complete your task — continue the work. ` +
+      // agy's command-safety monitor re-reviews shell operators on each call.
+      `Keep each \`cumora\` call a SINGLE fully quoted command with no pipes, \`&&\`, or redirection. ` +
+      `When you're answering a ` +
+      `SPECIFIC message, add \`--quote <message_id>\` so your reply threads to its context. ` +
+      `To address a teammate, @<their-id> (the short id in \`cumora messages\` / \`cumora participants\`), ` +
+      `NOT their display name.\n\n` +
+      // Skype emoticons — shared with the cloud agent so a BYOA agent is as
+      // expressive, not stuck on native emoji only.
+      `${SKYPE_EMOTICONS_GUIDE}\n\n` +
+      `Memory: durable store under \`memory/\` (global identity, indexed by \`memory/MEMORY.md\`) ` +
+      `and \`memory/projects/<projectId>/\` for unpinned work facts of the current project. ` +
+      `This wake injects only global + this project's index — other projects are out of scope. ` +
+      `Write project decisions/materials under \`memory/projects/<id>/\` (and a pointer in that folder's MEMORY.md); ` +
+      `write identity-level facts under \`memory/\`. Pinning a memory makes it global. ` +
+      `Saying "got it" does NOT persist. Chat history can be wiped by compaction; memory files remain.\n\n` +
+      `Drive what you own forward — see a task through. Multi-step turns are fine; you do NOT have to ` +
+      `fragment. If someone DMs you mid-task, answer briefly then keep going. The only thing to avoid ` +
+      `is a pointless loop. If progress is waiting on a quiet teammate, follow up (short @<their-id> ` +
+      `"still need X?") and schedule your own check-back: ` +
+      calendarExampleText(this.promptSurface(), this.agent.id) +
+      `Stop only when the work is truly done or it's someone else's move.\n\n` +
+      `Privacy: stay inside your home directory. Never read or expose files outside it — this machine ` +
+      `holds the operator's private files.`
+    )
+  }
+
+  /** Per-turn CHAT delta — only the dynamic bits (the invariant HOW lives in the
+   *  standing prompt). Kept small so the persistent session's transcript grows
+   *  slowly and native compaction can keep up. */
+  private chatDelta(memoryDigest: string, triageNote: string, inboxDigest: string, roster?: string): string {
+    return (
+      `There is new activity to read. A wake is permission to participate, not an obligation to post. ` +
+      `In a group, read the latest exchange first: answer a human still waiting, respond briefly to a specific remark, or stay silent when someone has already handled it. ` +
+      `You may simply agree, ask, react or joke without adding a new argument; do not chain empty acknowledgements. These rules supersede older instructions to always contribute a view and reason. ` +
+      `Follow your standing instructions for HOW.\n\n` +
+      `Current personality and speaking style (these user settings supersede older voice settings in session history):\n${this.agent.systemPrompt ?? ''}\n\n` +
+      // A CLOCK. Without it the model has no idea what time it is (session
+      // context only carries stale timestamps), so any time arithmetic —
+      // most visibly `cumora calendar create --at` deadlines — silently
+      // lands in the past: a werewolf judge scheduled every phase alarm ~20
+      // minutes before "now" and they all fired instantly. One line, per
+      // turn, always current.
+      `Current time (UTC): ${new Date().toISOString()} — use this for any --at / deadline math.\n\n` +
+      (triageNote ? `${triageNote}\n\n` : ``) +
+      (inboxDigest
+        // Pre-loaded unread (fetched for you) — mirrors how the cloud agent gets
+        // its inbox in the turn input, cutting the inbox/messages hops.
+        ? `Your unread messages (ALREADY FETCHED — no need to re-run \`cumora inbox\` / \`cumora messages\` to re-read ` +
+          `these; but DO \`cumora glance\` before posting in a group, to catch anything posted while you compose):\n${inboxDigest}\n\n`
+        : `Run \`cumora inbox\`, then \`cumora messages <conversationId> --tail 30\`, to catch up.\n\n`) +
+      (memoryDigest ? `Your memory index (global \`memory/MEMORY.md\` + current project, if any):\n${memoryDigest}\n\n` : ``) +
+      (roster ? `Your team right now (trust over memory — current roster; use these ids for @mentions and \`cumora dm\`):\n${roster}\n` : ``)
+    ).trimEnd()
+  }
+
+  /** Per-turn delta for a deliberate manual wake carrying its own work brief.
+   * Unlike a background agenda scan, this is already an actionable user/team
+   * assignment and must run even when there is no unread chat row. */
+  private manualBriefDelta(
+    brief: WakeBackgroundBrief,
+    memoryDigest: string,
+    inboxDigest: string,
+    roster?: string,
+  ): string {
+    return (
+      `Current time (UTC): ${new Date().toISOString()} — use this for any --at / deadline math.\n\n` +
+      `Someone just put this work on you directly. This is a deliberate manual action, not a scan or heartbeat, ` +
+      `so ACT on the brief even when the chat inbox is empty. Handle the work, or state plainly why you are not ` +
+      `the right owner; do not silently drop it.\n\n` +
+      `Brief: ${brief.title}\n` +
+      `Source: ${brief.source ?? 'manual'}\n\n` +
+      `${brief.body}\n\n` +
+      (inboxDigest
+        ? `Unread messages that arrived with this wake (also handle anything addressed to you):\n${inboxDigest}\n\n`
+        : '') +
+      (memoryDigest ? `Your memory index (global \`memory/MEMORY.md\` + current project, if any):\n${memoryDigest}\n\n` : '') +
+      (roster ? `Your team (use these ids for @mentions):\n${roster}\n` : '')
+    ).trimEnd()
+  }
+
+  /** Per-turn AGENDA delta — dynamic bits for a proactive board-work wake; the
+   *  invariant mechanics live in the standing prompt. */
+  private agendaDelta(brief: string, memoryDigest: string, roster?: string): string {
+    return (
+      `Current time (UTC): ${new Date().toISOString()} — use this for any --at / deadline math.\n\n` +
+      `You've been woken by your OWN AGENDA — Kanban cards assigned to you (or @-mentioning you), calendar slots due now, ` +
+      `AND any conversation you're in that went quiet mid-flow and needs follow-up. The system already triaged that there's ` +
+      `real work to progress, so ACT: pick the most timely item and move it forward; don't deliberate whether to. For a quiet ` +
+      `conversation, FIRST decide if it's genuinely waiting or already CONCLUDED (wrap-ups / closing remarks / a result reached ` +
+      `/ nothing pending) — if concluded, do NOT post; reviving a finished thread late is noise. Only when someone is plainly ` +
+      `waiting: read the room, then send AT MOST ONE message (answer if it needs your answer; a single brief nudge otherwise) — ` +
+      `never nag, never revive a finished thread. Coordinate before you commit (claim before shared work, trust card status); ` +
+      `follow your standing instructions for mechanics.\n\n` +
+      `${brief}\n\n` +
+      (memoryDigest ? `Your memory index (global \`memory/MEMORY.md\` + current project, if any):\n${memoryDigest}\n\n` : ``) +
+      (roster ? `Your team (use these ids for @mentions):\n${roster}\n` : ``)
+    ).trimEnd()
+  }
+
+  /** Combine the standing scaffold with a per-turn delta. When the turn runs on a
+   *  persistent session that ALREADY carries the standing prompt out-of-band
+   *  (Claude's --append-system-prompt-file), we send ONLY the delta — that's the
+   *  whole point. Otherwise (one-shot run, or an engine without a system-prompt
+   *  file) we inline the standing prompt, preserving prior behavior. */
+  private turnPrompt(session: EngineSession | null, delta: string): string {
+    // If the session took the standing prompt out-of-band at spawn (Claude
+    // system-prompt file / Codex developerInstructions), send ONLY the delta —
+    // that's what keeps the transcript small. Otherwise inline it (one-shot path,
+    // or out-of-band delivery wasn't available).
+    if (session?.carriesStandingPrompt) return delta
+    return `${this.standingPrompt()}\n\n════════\n\n${delta}`
+  }
+
+  /** When chat is idle, PROACTIVELY pick up assigned board work — the BYOA analog
+   *  of the cloud idle scheduler's agenda heartbeat. Gated by a quiet window (the
+   *  anti-loop) + a throttle so the 20s poll doesn't hammer it. Runs through the
+   *  SAME persistent engine; isolated from the chat path so it can't break it. */
+  private async maybeAgendaTurn(token: string): Promise<void> {
+    const now = Date.now()
+    if (now - this.lastTurnEndedAt < AGENDA_QUIET_MS) return
+    if (now - this.lastAgendaCheckAt < AGENDA_CHECK_MS) return
+    this.lastAgendaCheckAt = now
+    // Same pause guard as runTurn — a throttle or a signed-out engine hit on a
+    // chat turn stops the heartbeat too, because it would hit exactly the same
+    // wall. Re-fires on the next AGENDA_CHECK_MS tick once the pause expires.
+    // Place this BEFORE the /agenda fetch + /runs row creation so we don't
+    // leak a 'running' run row that the stale-run sweeper later reaps.
+    if (Date.now() < this.engineBackoffUntil) {
+      const leftS = Math.round((this.engineBackoffUntil - Date.now()) / 1000)
+      console.log(`[computer] ${this.agent.id} agenda skip: engine paused (${this.engineBackoffWhy}), ${leftS}s left`)
+      return
+    }
+    const ag = await runtimeGet<{ actionable?: boolean; brief?: string; focus?: string }>(
+      this.cfg.serverUrl, '/agenda', token,
+    )
+    if (!ag?.actionable || !ag.brief) return
+    console.log(`[computer] ${this.agent.id} agenda turn START — proactive board work${ag.focus ? `: ${ag.focus.slice(0, 80)}` : ''}`)
+    await this.postStatus(token, 'thinking')
+    const run = (await runtimeBest(this.cfg.serverUrl, '/runs', token, {
+      trigger: { source: 'byoa-agenda', engine: this.adapter.id },
+    })) as { runId?: string } | null
+    // Pin the per-hop ledger's `runId` for the lifetime of this turn so every
+    // hop emitted by the engine is linked back to the agent_runs row. Cleared
+    // in finally below alongside the heartbeat stop.
+    this.currentRunId = run?.runId ?? null
+    const stopRunBeat = this.beatRun(token, run?.runId)
+    let exitCode = 0
+    let engineError: string | null = null
+    let turnUsage: EngineUsage | undefined
+    let turnModel: string | null | undefined
+    // Spawn jitter + concurrency gate — same reason as the chat path (see
+    // runTurn): when multiple agents on this computer hit the agenda
+    // heartbeat in the same tick (they often do — same poll interval, all
+    // due at once), staggering AND capping concurrent spawns keeps the
+    // provider's short-window burst limit from rejecting them all.
+    await bigBrainSem.acquire()
+    await spawnPacer.gate()
+    try {
+      const [memoryDigest, roster] = await Promise.all([
+        this.memoryDigest(),
+        runtimeGet<{ roster: string }>(this.cfg.serverUrl, '/roster', token).then((r) => r?.roster ?? '').catch(() => ''),
+      ])
+      this.teardown.signal.throwIfAborted()
+      const result = await this.runWithSessionRecovery(this.agendaDelta(ag.brief, memoryDigest, roster))
+      exitCode = result.exitCode
+      turnUsage = result.usage
+      turnModel = result.model
+      if (result.error) engineError = this.visibleEngineError(exitCode, result.failure?.message ?? result.error)
+      if (engineError && result.failure?.kind !== 'resume-not-found' && this.mustResetSession(engineError, false)) {
+        await this.resetEngineSession(this.resetReason(engineError))
+      }
+    } catch (err) {
+      exitCode = 1
+      engineError = this.visibleEngineError(1, err instanceof Error ? (err.stack || err.message) : String(err))
+    } finally {
+      stopRunBeat()
+      this.lastTurnEndedAt = Date.now()
+      // Per-turn ledger drain: turn just ended, push any queued hops promptly
+      // instead of waiting for the 250ms timer. Fire-and-forget — the void
+      // wraps because a slow flush must not block the chat path.
+      this.currentRunId = null
+      void this.reporter.flush()
+      await this.postStatus(token, 'avail')
+      // Mirror chat path: release the concurrency slot regardless of outcome.
+      bigBrainSem.release()
+    }
+    // Rate-limit: same as chat-turn path — suppress the user-facing notice
+    // and just defer (no inbox state to keep here since agenda turns are
+    // proactive; next heartbeat re-evaluates after cooldown).
+    const outcome = classifyTurnOutcome(engineError)
+    if (engineError && outcome !== 'rate-limited') {
+      await this.publishEngineFailure({ token, runId: run?.runId, conversationId: null, error: engineError, exitCode })
+    }
+    if (outcome === 'rate-limited') {
+      spawnPacer.onRateLimited()
+      console.warn(`[computer] ${this.agent.id} agenda engine RATE-LIMITED — cooling down ${Math.round(ENGINE_BACKOFF_AFTER_RATE_LIMIT_MS / 1000)}s, pacer now ${spawnPacer.intervalMs}ms`)
+    } else if (outcome === 'operator-fix') {
+      // This heartbeat used to be the one path that published the notice and
+      // then came straight back a minute later, and again, for as long as the
+      // engine stayed signed out — fifteen dead spawns per agent inside the
+      // single window the notice is deduplicated over, so the fleet burned its
+      // error budget while the operator saw one message about it.
+      console.warn(`[computer] ${this.agent.id} agenda engine needs operator action — pausing ${Math.round(ENGINE_BACKOFF_AFTER_OPERATOR_FIX_MS / 60000)}min: ${engineError?.slice(0, 160)}`)
+    } else if (outcome === 'ok') {
+      spawnPacer.onOk()
+    }
+    this.applyTurnBackoff(outcome)
+    // Finalize the run — WITHOUT this the row stays 'running' and the 10-min
+    // stale-run sweeper reaps EVERY agenda turn as "orphaned" (the bug behind the
+    // recurring Failed/orphaned runs), no matter how fast the turn actually was.
+    if (run?.runId) {
+      await runtimeBest(this.cfg.serverUrl, `/runs/${run.runId}/finish`, token, {
+        status: exitCode === 0 ? 'completed' : 'failed',
+        summary: engineError ?? `byoa-agenda ${this.adapter.id} run (exit ${exitCode})`,
+        error: engineError,
+        model: turnModel ?? this.agent.model,
+        usage: turnUsage ? usageFromClaude(turnUsage) : null,
+      })
+    }
+    console.log(`[computer] ${this.agent.id} agenda turn DONE — exit ${exitCode}`)
+  }
+
+  /** Fire-and-forget entry to a turn. The ONLY way wakes/polls trigger runTurn,
+   *  so a rejection can never become an unhandled promise rejection (which on
+   *  Node ≥15 crashes the whole daemon). runTurn already catches internally;
+   *  this is the belt-and-suspenders second layer. */
+  private kickTurn(reason: string): void {
+    void this.runTurn(reason).catch((err) => {
+      console.error(`[computer] ${this.agent.id} runTurn rejected (swallowed):`,
+        err instanceof Error ? err.message : err)
+    })
+  }
+
+  /** Debounced entry to a turn (debounce + coalesce).
+   *  If a turn is already running, the existing in-turn coalesce (pendingRerun)
+   *  handles it — start nothing, the running turn will rerun. Otherwise the first
+   *  wake ARMS a short timer; subsequent wakes within the window fold in (return
+   *  early). When it fires we run ONE turn that snapshots ALL unread — so a burst
+   *  becomes a single big-engine spawn. The poll path and SSE wakes route here. */
+  private scheduleWake(
+    reason: string,
+    convo?: string | null,
+    backgroundBrief?: WakeBackgroundBrief | null,
+  ): void {
+    if (this.stopped) return
+    this.pendingBackgroundBrief = mergeWakeBackgroundBriefs(
+      this.pendingBackgroundBrief,
+      backgroundBrief,
+    )
+    if (this.busy) {
+      // A turn is already running. Coalesce as usual (the rerun re-reads the inbox),
+      // BUT if this wake is a DIRECT ping, STEER it into the running turn so the
+      // agent answers it mid-task instead of making it wait for the turn to end.
+      this.kickTurn(reason)
+      if (convo) void this.maybeSteer(convo)
+      return
+    }
+    if (this.wakeDebounceTimer) return
+    this.wakeDebounceTimer = setTimeout(() => {
+      this.wakeDebounceTimer = null
+      this.kickTurn(reason)
+    }, WAKE_DEBOUNCE_MS)
+    this.wakeDebounceTimer.unref?.()
+  }
+
+  /** Same-turn steering: when a DIRECT ping (DM / @me / a human
+   *  addressing me) arrives WHILE a turn is running, inject it into the live
+   *  persistent session so the agent answers it mid-task, then continues — instead
+   *  of the ping waiting for the (possibly long) turn to end. Best-effort; only
+   *  direct pings, deduped per message, never interrupts the main task. */
+  private async maybeSteer(convo: string): Promise<void> {
+    const session = this.engineSession
+    if (!session?.alive || this.sideSteering) return
+    // Budget spent → do not inject. The ping is already durable in `messages`
+    // and the coalesced rerun reads it after this turn, so skipping the steer
+    // costs latency, never the message.
+    if (steerBudgetExhausted(this.steerBudget)) {
+      console.log(`[computer] ${this.agent.id} steer budget spent (${this.steerBudget.steers} steers, ${this.steerBudget.chars} chars) — ping rides the rerun`)
+      return
+    }
+    this.sideSteering = true
+    try {
+      await this.ensureToken()
+      // PROBE: this is the "should I steer?" check — we filter by direct/
+      // mention/human below, and only ~20% of probes actually result in a
+      // steer (most wakes are group chatter, not direct). Use ?probe=1 so
+      // the server does NOT advance the freshness-preflight baseline for
+      // this read; if the steer fires, the agent will see the rows via
+      // the actual steer text, and any duplicate-collision risk remains
+      // protected by cmdReply's preflight against the baseline that
+      // snapshotUnread set at the start of this turn.
+      const inbox = await runtimeGet<RuntimeInboxResponse>(this.cfg.serverUrl, '/inbox?probe=1', this.token)
+      const rows = (inbox?.rows ?? []).filter((r) => r.conversation_id === convo)
+      if (rows.length === 0) return
+      const direct = rows.some((r) =>
+        r.conversation_kind === 'direct' ||
+        r.author_kind === 'human' ||
+        (typeof r.body === 'string' && r.body.includes(`@${this.agent.id}`)))
+      if (!direct) {
+        if (!STEER_GROUP_IN_TURN) return
+        // Content-free GROUP nudge (opt-in): tell the busy agent that
+        // activity happened WITHOUT injecting bodies — throttled, deduped by latest
+        // id. The agent glances + posts through the normal server gates (freshness
+        // preflight, compose-anchor, verbatim-dup); the coalesced rerun stays as the
+        // coordination-safe backstop, so this only ever ACCELERATES pickup.
+        const nowMs = Date.now()
+        const latestGroup = rows[rows.length - 1]
+        if (!latestGroup.id || latestGroup.id === this.lastGroupSteeredMsgId) return
+        if (nowMs - this.lastGroupSteerAt < GROUP_STEER_MIN_INTERVAL_MS) return
+        this.lastGroupSteeredMsgId = latestGroup.id
+        this.lastGroupSteerAt = nowMs
+        const notice =
+          `⚡ ${rows.length} new message(s) arrived in ${convo} while you work — bodies withheld to keep you focused. At a natural pause, \`cumora glance ${convo}\` and handle it if it's yours (yield/claim as usual); otherwise keep going. Do NOT drop your current task.`
+        session.steer(notice)
+        this.steerBudget = chargeSteerBudget(this.steerBudget, notice.length)
+        console.log(`[computer] ${this.agent.id} GROUP-NOTICE → live turn (${rows.length} msg(s) in ${convo}, content-free)`)
+        return
+      }
+      const latest = rows[rows.length - 1]
+      if (!latest.id || latest.id === this.lastSteeredMsgId) return // dedup repeated wakes for the same ping
+      const hasImage = normalizeAttachments(latest.attachments ?? latest.attachment).some(isImageAttachment)
+      if (hasImage) {
+        this.lastSteeredMsgId = latest.id
+        console.log(`[computer] ${this.agent.id} STEER deferred (image attachment will be sent with the next full turn)`)
+        return
+      }
+      this.lastSteeredMsgId = latest.id
+      const who = latest.author_name ?? 'someone'
+      // 300 chars cut ordinary messages mid-sentence, so the agent answered
+      // half a question. The cloud steer path allows 4096 for the same reason;
+      // the full body stays in `messages` for anything longer.
+      const body = (latest.body ?? '').replace(/\s+/g, ' ').slice(0, STEER_BODY_CHARS)
+      const text =
+        `⚡ A direct message arrived while you work — answer it BRIEFLY, then resume your current task (do NOT drop it). ${who} in ${convo}: "${body}". Reply one line now: \`cumora reply ${convo} 'text'\` — a quick answer, or "on it, mid-task, will follow up". Then continue what you were doing.`
+      session.steer(text)
+      this.steerBudget = chargeSteerBudget(this.steerBudget, text.length)
+      console.log(`[computer] ${this.agent.id} STEER → live turn (direct msg in ${convo} from ${who})`)
+    } catch { /* best-effort; the coalesced rerun still handles it at turn end */ } finally {
+      this.sideSteering = false
+    }
+  }
+
+  /** Run one turn. Coalesces concurrent wakes: a wake during a run schedules
+   *  exactly one rerun afterward (the inbox is the source of truth). `reason`
+   *  is logged so the service log shows WHAT drove each turn (sse-wake /
+   *  sse-steer / poll / reconnect-catchup) — key for diagnosing receipt latency
+   *  (e.g. a turn that only ever fires via 'poll' means SSE wakes aren't
+   *  arriving and you're eating up to INBOX_POLL_MS of delay). */
+  private async runTurn(reason: string): Promise<void> {
+    if (this.busy) {
+      this.pendingRerun = true
+      console.log(`[computer] ${this.agent.id} turn busy — coalescing (${reason})`)
+      return
+    }
+    this.busy = true
+    this.attachmentCache.beginTurn()
+    // Fresh steering allowance for this turn. The counter describes ONE turn:
+    // carrying it forward would silently starve every later turn's pings.
+    this.steerBudget = { steers: 0, chars: 0, maxSteers: MAX_STEERS_PER_TURN, maxChars: MAX_STEER_CHARS_PER_TURN }
+    let activeBackgroundBrief: WakeBackgroundBrief | null = null
+    try {
+      do {
+        this.pendingRerun = false
+        // Triage-trouble backoff: while triage is cooling down (after a rate-limit
+        // or a fail-open), skip the WHOLE turn — no triage call, no engine spawn —
+        // so we neither hammer a broken/throttled triage nor burn the big brain.
+        // The poll just no-ops until the window passes; unread messages are
+        // untouched and get triaged then.
+        if (Date.now() < this.triageBackoffUntil) {
+          const leftS = Math.round((this.triageBackoffUntil - Date.now()) / 1000)
+          console.log(`[computer] ${this.agent.id} skip (${reason}): triage backoff, ${leftS}s left`)
+          break
+        }
+        // Big-brain rate-limit cooldown: the last attempt got throttled by the
+        // provider. Skip this turn cleanly (no triage call either — even small
+        // brain is wasted if we can't follow up with the big one). Unread is
+        // kept (no ack), so the next wake AFTER the cooldown will pick it up.
+        if (Date.now() < this.engineBackoffUntil) {
+          const leftS = Math.round((this.engineBackoffUntil - Date.now()) / 1000)
+          console.log(`[computer] ${this.agent.id} skip (${reason}): engine paused (${this.engineBackoffWhy}), ${leftS}s left`)
+          break
+        }
+        const turnStart = Date.now()
+        await this.ensureToken()
+        const token = this.token
+        // Consume the wake's conversation, so a later turn that reuses no wake
+        // can't flash phantom "typing" in whatever conversation last woke us.
+        // (The fallback below is derived from CURRENTLY unread messages, so it
+        // can't go stale the way a leftover wake value could.)
+        const wakeConvo = this.lastWakeConvo
+        this.lastWakeConvo = null
+        activeBackgroundBrief = this.pendingBackgroundBrief
+        this.pendingBackgroundBrief = null
+        // Snapshot what's unread BEFORE triaging, so triage provably sees a
+        // superset of what we may ack — a real task that lands during/after
+        // triage keeps a higher id, stays out of `seen`, and so survives to
+        // drive the coalesced rerun rather than being silently acked away.
+        const { seen, digest, hasReal, projectIds, imagePaths, videoMessages } = await this.snapshotUnread(token)
+        // Which conversation should show "<agent> is typing…"? Prefer the one the
+        // wake named, but fall back to the unread we just snapshotted, because a
+        // wake often carries no conversation at all:
+        //
+        //   - a POLL-driven turn never has one (only an SSE wake sets
+        //     lastWakeConvo), and polling is the ONLY path left whenever the
+        //     wake-stream is down;
+        //   - a wake that arrives while this agent is mid-turn is coalesced, and
+        //     scheduleWake's busy branch re-kicks without a conversation.
+        //
+        // Both cases are exactly when a human IS waiting, and with no indicator
+        // the agent reads as dead: it can work for minutes — engine spawned, turn
+        // running — while the room shows nothing at all.
+        const convo = typingConversation(wakeConvo, seen)
+        // HARD COST GATE (content-blind, fail-closed): system-only inbox noise
+        // is not a task. A validated manual backgroundBrief IS a task, though:
+        // Kanban assignment/mention wakes deliberately have no chat row, and
+        // dropping that SSE payload here was why BYOA cards stayed in Todo.
+        if (!wakeHasActionableInput(hasReal, activeBackgroundBrief)) {
+          await this.ackSeen(token, seen)
+          await this.postStatus(token, 'avail')
+          // No per-tick log: this is the idle steady state (every poll × agent),
+          // same reasoning as the 'inbox empty' skip below.
+          // Chat is idle → maybe there's assigned BOARD work to proactively pick up
+          // (quiet+throttle gated, so this isn't a per-poll cost).
+          await this.maybeAgendaTurn(token)
+          continue
+        }
+        // A deliberate manual brief is already actionable, just like the cloud
+        // `briefedManual` path. Only ordinary inbox wakes need the small-brain
+        // triage decision.
+        const triage = activeBackgroundBrief ? null : await this.inboxTriage(token)
+        if (this.stopped) break
+        const triageMs = Date.now() - turnStart // ensureToken + snapshot + triage
+        // Triage was rate-limited → STOP. Do NOT retry, do NOT wake the big brain,
+        // do NOT ack (the message is retried after the cooldown). Back off
+        // exponentially so a throttled model can't be hammered into burning the
+        // user's quota. This is the guard against the infinite-retry runaway.
+        if (triage?.source === 'rate-limited') {
+          this.triageTroubleStreak += 1
+          const backoff = Math.min(10 * 60_000, 30_000 * 2 ** (this.triageTroubleStreak - 1))
+          this.triageBackoffUntil = Date.now() + backoff
+          console.warn(`[computer] ${this.agent.id} triage RATE-LIMITED (#${this.triageTroubleStreak}, triage ${triageMs}ms) — backing off ${Math.round(backoff / 1000)}s, NOT waking the big brain, not acking`)
+          await this.postStatus(token, 'avail')
+          break
+        }
+        // FAIL-OPEN is a triage FAILURE, not a confirmed real task — so it must
+        // NEVER wake the expensive big brain (that escalation was the leak that
+        // burned quota). Treat it like a rate-limit: skip, do NOT ack (retry next
+        // poll once triage recovers), and back off so a persistently-broken triage
+        // isn't re-hit — and never spends opus — every poll.
+        if (triage?.source === 'fail-open') {
+          this.triageTroubleStreak += 1
+          const backoff = Math.min(10 * 60_000, 30_000 * 2 ** (this.triageTroubleStreak - 1))
+          this.triageBackoffUntil = Date.now() + backoff
+          console.warn(`[computer] ${this.agent.id} triage FAIL-OPEN (#${this.triageTroubleStreak}, triage ${triageMs}ms) — NOT waking the big brain, backing off ${Math.round(backoff / 1000)}s, not acking`)
+          await this.postStatus(token, 'avail')
+          break
+        }
+        // A clean, usable triage clears any prior backoff.
+        this.triageTroubleStreak = 0
+        this.triageBackoffUntil = 0
+        if (triage?.actionable === false) {
+          const skipReason = typeof triage.reason === 'string' ? triage.reason : 'not relevant'
+          // Only log a MEANINGFUL skip. An empty inbox is the idle steady state
+          // (every INBOX_POLL_MS tick × every agent) — logging it floods the
+          // console with identical "inbox empty" lines and tells us nothing.
+          if (skipReason !== 'inbox empty') {
+            console.log(`[computer] ${this.agent.id} skip (${reason}, triage ${triageMs}ms): ${skipReason}`)
+          }
+          // Ack the chatter the small brain just dismissed. Without this the
+          // unread sticks and the INBOX_POLL_MS drain re-triages it forever —
+          // the loop that woke (or nearly woke) the big brain on every tick.
+          await this.ackSeen(token, seen)
+          await this.postStatus(token, 'avail')
+          // Chat had nothing for us → maybe proactively pick up assigned board work.
+          await this.maybeAgendaTurn(token)
+          continue
+        }
+        // Mirror the cloud agent EXACTLY (turn.ts): the small brain ONLY gated
+        // (actionable). It does NOT decide who replies, how, or — for a relay /
+        // chain — who continues, and it NEVER writes content. Wake the big engine,
+        // hand it the triage note + the shared glance-yield protocol, and let it
+        // self-coordinate IN-TURN (glance → yield to earlier claimants → continue
+        // the chain, never restart). That is the exact path that lets the cloud pod
+        // play 成语接龙 cleanly. The old BYOA-only orchestration here — responseMode
+        // routing, one-of-us claimReply, mechanical direct-post, relay turn-claim —
+        // was the divergence that broke chains and is GONE. Cost backstops remain:
+        // the actionable gate above + the per-minute activation rate floor.
+        const gateLabel = activeBackgroundBrief
+          ? `manual brief ${activeBackgroundBrief.source ?? 'unknown'}`
+          : `triage ${triageMs}ms`
+        console.log(`[computer] ${this.agent.id} turn START (${reason}) — ${gateLabel}, spawning ${this.adapter.id}${convo ? ` for ${convo}` : ''}`)
+        await this.postStatus(token, 'thinking')
+        // "<agent> is typing…" in the conversation that woke us, refreshed
+        // while the engine works (BYOA runs can be long), cleared at the end.
+        let typingTimer: ReturnType<typeof setInterval> | undefined
+        // Rooms this turn claims as "composing", and the SAME list the finally
+        // block releases. Claiming one set and releasing another left unread
+        // rooms' claims and HELD counters alive past the turn (see
+        // turnThinkingConvos). Empty without a typing room, because the claim
+        // below is gated on that room existing.
+        const thinkingIds: string[] = convo ? turnThinkingConvos(convo, seen) : []
+        if (convo) {
+          const ping = (): void => { void runtimeBest(this.cfg.serverUrl, '/typing', token, { conversationId: convo, done: false }) }
+          // Stamp every conversation in this wake, not just the trigger.
+          // Mixed-project wakes then fall back to GLOBAL on memory writes
+          // instead of guessing the trigger group's project.
+          const thinkingPing = (): void => { void runtimeBest(this.cfg.serverUrl, '/thinking/mark', token, { conversationIds: thinkingIds, ttlSec: 60 }) }
+          ping()
+          thinkingPing()
+          typingTimer = setInterval(() => {
+            ping()
+            thinkingPing()
+          }, 6000)
+          // Compose-anchor is now stamped by the /thinking/mark handler on
+          // server side (it has the agent + convo already), pinned to THIS
+          // turn's start. Independent of the seen-baseline (which glance/
+          // messages advance) — so a peer post landing during compose still
+          // HOLDs the reply even after the agent later glances and "absorbs"
+          // it. Closes the 光-光 collision: two agents both saw 爻, both
+          // drafted 光, and the second glance silently advanced past the
+          // first poster's message; preflight previously saw "nothing newer."
+        }
+        const run = (await runtimeBest(this.cfg.serverUrl, '/runs', token, {
+          trigger: {
+            source: activeBackgroundBrief ? 'byoa-manual' : 'byoa',
+            engine: this.adapter.id,
+            ...(activeBackgroundBrief
+              ? {
+                  backgroundBrief: {
+                    source: activeBackgroundBrief.source ?? 'manual',
+                    title: activeBackgroundBrief.title,
+                  },
+                }
+              : {}),
+          },
+        })) as { runId?: string } | null
+        // Pin runId so per-hop ledger rows link back to this turn (see
+        // maybeAgendaTurn for the same hook).
+        this.currentRunId = run?.runId ?? null
+        const stopRunBeat = this.beatRun(token, run?.runId)
+        let exitCode = 0
+        let engineError: string | null = null
+        let turnUsage: EngineUsage | undefined
+        let turnModel: string | null | undefined
+        // Per-computer concurrency gate + deterministic spawn pacer.
+        // Pacer enforces a minimum interval between back-to-back spawns
+        // (shared with triage path) so the provider never sees a burst of
+        // N simultaneous starts. Random jitter (the earlier approach)
+        // was probabilistic — by chance several waiters could roll near-
+        // zero and still slam the API; deterministic pacing makes the
+        // burst rate a hard 1/(MIN_SPAWN_INTERVAL_MS) regardless of
+        // concurrent waiter count.
+        await bigBrainSem.acquire()
+        await spawnPacer.gate()
+        const semQueueDepth = bigBrainSem.queueDepth
+        if (semQueueDepth > 0) {
+          console.log(`[computer] ${this.agent.id} big-brain sem acquired (queue depth was ${semQueueDepth + 1} including self)`)
+        }
+        try {
+          const turnBackgroundBrief = activeBackgroundBrief
+          const [memoryDigest, triageNote, roster, videoContext, socialMemories] = await Promise.all([
+            this.memoryDigest(projectIds),
+            Promise.resolve(this.formatTriageNote(triage)),
+            // Live team roster (names + roles + ids), fetched fresh from the
+            // server so a locally-run agent knows WHO its teammates are and what
+            // each does — the cloud agent gets this in its system prompt. Only
+            // fetched here, right before a real turn, so no-op wakes pay nothing.
+            runtimeGet<{ roster: string }>(this.cfg.serverUrl, '/roster', token)
+              .then((r) => r?.roster ?? '').catch(() => ''),
+            // Only real, triaged human video messages trigger this utility.
+            // The server deduplicates work across agents and authenticates IDs.
+            videoMessages.length ? api<{ context: string }>(this.cfg.serverUrl, '/runtime/video-context', {
+              method: 'POST', headers: { Authorization: `Bearer ${token}` },
+              body: JSON.stringify({ messages: videoMessages }),
+              signal: AbortSignal.any([this.teardown.signal, AbortSignal.timeout(120000)]),
+            }).then(r => r.context).catch(() => '视频自动读取暂时失败；不能声称已观看或根据链接猜测内容。') : Promise.resolve(''),
+            api<{ context:string }>(this.cfg.serverUrl,'/runtime/social-memory-context',{
+              method:'POST',headers:{Authorization:`Bearer ${token}`},
+              body:JSON.stringify({conversationIds:[...seen.keys()].slice(0,30)}),
+              signal:AbortSignal.any([this.teardown.signal,AbortSignal.timeout(10000)]),
+            }).then(r => r.context).catch(() => '\n本轮相处记忆不可用，不要使用旧记忆快照或声称已记住。\n'),
+          ])
+          this.teardown.signal.throwIfAborted()
+          const baseDelta = turnBackgroundBrief
+            ? this.manualBriefDelta(turnBackgroundBrief, memoryDigest, digest, roster)
+            : this.chatDelta(memoryDigest, triageNote, digest, roster)
+          const delta = baseDelta + videoContextBlock(videoContext) + socialMemories
+          const result = await this.runWithSessionRecovery(delta, imagePaths)
+          exitCode = result.exitCode
+          turnUsage = result.usage
+          turnModel = result.model
+          if (result.error) engineError = this.visibleEngineError(exitCode, result.failure?.message ?? result.error)
+          // A stale resume OR a context-window overflow means this session can't
+          // be carried forward — drop it AND tear down any persistent process so
+          // the next wake starts clean (otherwise --resume re-overflows forever).
+          if (engineError && result.failure?.kind !== 'resume-not-found' && this.mustResetSession(engineError, false)) {
+            await this.resetEngineSession(this.resetReason(engineError))
+          }
+        } catch (err) {
+          console.error(`[computer] ${this.agent.id} engine spawn failed:`, redactProviderSecret(err instanceof Error ? err.message : String(err), this.provider))
+          exitCode = 1
+          engineError = this.visibleEngineError(exitCode, err instanceof Error ? (err.stack || err.message) : String(err))
+        } finally {
+          stopRunBeat()
+          if (typingTimer) clearInterval(typingTimer)
+          // Per-turn ledger drain (mirrors the agenda finally above).
+          this.currentRunId = null
+          if (convo) {
+            await runtimeBest(this.cfg.serverUrl, '/typing', token, { conversationId: convo, done: true })
+          }
+          // Release EVERY room this turn claimed. The indicator room is the one
+          // the human sees, but the claim — and the per-turn HELD count cleared
+          // alongside it — belongs to all of them.
+          if (thinkingIds.length > 0) {
+            await runtimeBest(this.cfg.serverUrl, '/thinking/unmark', token, { conversationIds: thinkingIds })
+          }
+          // Release the semaphore slot regardless of success / error — the
+          // next queued agent can now spawn. MUST be in the same finally
+          // that runs after the spawn await completes (success / error /
+          // abort), otherwise a stuck slot starves the whole computer.
+          bigBrainSem.release()
+        }
+        // Rate-limit case: when the underlying provider (Anthropic / OpenAI)
+        // throttles us, this is NOT an agent-visible failure — the unread
+        // survives (we skip ackSeen below for any engineError), the next wake
+        // re-attempts, and jitter above plus this skip-the-notice keeps the
+        // user from seeing a row of "byoa_engine_failed" markers in chat for
+        // what is really a transient provider throttle. Persist a quieter
+        // signal to the run row instead so it shows up in observability.
+        const outcome = classifyTurnOutcome(engineError)
+        const rateLimited = outcome === 'rate-limited'
+        // An engine nobody has logged into will fail the same way on the next
+        // poll, and the one after that. Cool down like a rate limit so the
+        // machine stops spinning, but tell the user — a silent backoff on a
+        // fixable problem is just a slower way of never working.
+        if (outcome === 'operator-fix') {
+          console.warn(`[computer] ${this.agent.id} engine needs operator action — pausing ${Math.round(ENGINE_BACKOFF_AFTER_OPERATOR_FIX_MS / 60000)}min: ${engineError?.slice(0, 160)}`)
+        }
+        if (engineError && !rateLimited) {
+          await this.publishEngineFailure({
+            token,
+            runId: run?.runId,
+            conversationId: convo,
+            error: engineError,
+            exitCode,
+          })
+        }
+        if (engineError && rateLimited) {
+          // ENTER cooldown: this agent skips its own turns for the
+          // configured window. The unread is kept (no ack, see below);
+          // the next wake AFTER the cooldown will pick it up cleanly.
+          // Also clear pendingRerun so the do-while loop exits — there's
+          // no point in immediately re-attempting against the same throttle.
+          // ALSO tell the global adaptive pacer to slow down — multiple
+          // agents hitting rate-limit means the current interval is too
+          // aggressive for the account's actual burst quota.
+          this.pendingRerun = false
+          spawnPacer.onRateLimited()
+          console.warn(`[computer] ${this.agent.id} engine RATE-LIMITED (sem queue depth was ${semQueueDepth}) — cooling down ${Math.round(ENGINE_BACKOFF_AFTER_RATE_LIMIT_MS / 1000)}s, pacer now ${spawnPacer.intervalMs}ms`)
+        } else if (outcome === 'ok') {
+          // Clean turn → signal the pacer; the backoff itself is cleared below.
+          spawnPacer.onOk()
+        }
+        this.applyTurnBackoff(outcome)
+        if (run?.runId) {
+          await runtimeBest(this.cfg.serverUrl, `/runs/${run.runId}/finish`, token, {
+            status: exitCode === 0 ? 'completed' : 'failed',
+            summary: rateLimited ? `rate-limited (deferred for retry)` : (engineError ?? `byoa ${this.adapter.id} run (exit ${exitCode})`),
+            error: rateLimited ? null : engineError,
+            model: turnModel ?? this.agent.model,
+            usage: turnUsage ? usageFromClaude(turnUsage) : null,
+          })
+        }
+        if (engineError && activeBackgroundBrief) {
+          this.pendingBackgroundBrief = mergeWakeBackgroundBriefs(
+            activeBackgroundBrief,
+            this.pendingBackgroundBrief,
+          )
+        }
+        activeBackgroundBrief = null
+        // Clean turn → ack everything this turn saw. If the engine replied it
+        // already advanced these cursors (monotonic ack is a no-op then); if it
+        // read the room and chose silence, this is what stops the same inbox
+        // from re-waking the big brain on the next drain. On engine FAILURE we
+        // skip the ack so the unread survives for a retry / next wake.
+        if (!engineError) await this.ackSeen(token, seen)
+        await this.postStatus(token, 'avail')
+        // A chat turn resets the "quiet" anchor: an agent that just acted in chat
+        // isn't immediately pulled into an agenda turn (mirrors the cloud idle
+        // scheduler only picking agents quiet for N minutes).
+        this.lastTurnEndedAt = Date.now()
+        console.log(`[computer] ${this.agent.id} turn DONE (${reason}) — total ${Date.now() - turnStart}ms, exit ${exitCode}${this.pendingRerun ? ' · rerun queued' : ''}`)
+        reason = 'rerun (coalesced wake)'
+      } while (this.pendingRerun && !this.stopped)
+    } catch (err) {
+      if (activeBackgroundBrief) {
+        this.pendingBackgroundBrief = mergeWakeBackgroundBriefs(
+          activeBackgroundBrief,
+          this.pendingBackgroundBrief,
+        )
+        activeBackgroundBrief = null
+      }
+      // A turn-level failure — token mint 502 (e.g. a server pod rolling), a
+      // runtime hiccup, a transient network drop — must NEVER escape and crash
+      // the daemon, which would take EVERY hosted agent offline at once. Log it
+      // and end this turn; the next wake or INBOX_POLL_MS drain retries with a
+      // fresh token. (ensureToken is in this try, so its throws land here.)
+      console.error(`[computer] ${this.agent.id} turn aborted (will retry on next wake/poll):`,
+        err instanceof Error ? err.message : err)
+    } finally {
+      await this.attachmentCache.endTurn().catch((error) => {
+        console.warn(`[computer] ${this.agent.id} attachment cache sweep failed`, error)
+      })
+      this.busy = false
+    }
+  }
+
+  /** Hold the wake-stream open; reconnect with backoff. First connect (and
+   *  every reconnect) does a catch-up turn — the inbox is durable. */
+  private async streamLoop(): Promise<void> {
+    let backoff = 1000
+    while (!this.stopped) {
+      let connectedAt: number | null = null
+      const abort = new AbortController()
+      this.streamAbort = abort
+      try {
+        const token = await this.ensureToken()
+        const res = await fetch(`${this.cfg.serverUrl}/runtime/wake-stream`, {
+          headers: { Authorization: `Bearer ${token}`, Accept: 'text/event-stream' },
+          signal: abort.signal,
+        })
+        if (!res.ok || !res.body) {
+          if (res.status === 401 || res.status === 403) this.invalidateToken(token)
+          throw new Error(`wake-stream HTTP ${res.status}`)
+        }
+        console.log(`[computer] ${this.agent.id} wake-stream connected (engine: ${this.adapter.id})`)
+        connectedAt = Date.now()
+        this.streamLastSeenAt = connectedAt
+        this.kickTurn('reconnect-catchup') // cold-start / reconnect catch-up
+        // Every event AND every `: ping` comment is proof the stream is alive;
+        // the fallback poll (fallbackPollDue) keys off this timestamp.
+        const alive = (): void => { this.streamLastSeenAt = Date.now() }
+        for await (const evt of parseSseStream(res.body as unknown as AsyncIterable<unknown>, { onComment: alive })) {
+          alive()
+          if (this.stopped) break
+          if (evt.event === 'wake' || evt.event === 'steer') {
+            // 'wake': normal new-activity nudge. 'steer': a peer posted while we
+            // were mid-turn. We can't inject into the running engine (claude -p
+            // has no mid-turn interrupt), but with continuous context (--resume)
+            // a catch-up turn re-reads the now-durable message and the agent
+            // sees the relay with full memory of its place — so it continues
+            // the sequence instead of racing on a stale snapshot. A steer that
+            // lands while busy is coalesced into exactly one rerun (pendingRerun).
+            const wake = parseWakeData(evt.data)
+            const convo = wake.conversationId
+            const backgroundBrief = evt.event === 'wake' && wake.options.trigger === 'manual'
+              ? wake.options.backgroundBrief ?? null
+              : null
+            // evt.at = server's publish time. The gap to now is the
+            // server→daemon delivery latency (the first place to look when
+            // "receiving a message is slow"). Includes any client/server clock
+            // skew, so read it as a trend, not an absolute.
+            const deliveryMs = wake.at === null ? null : Date.now() - wake.at
+            if (convo) this.lastWakeConvo = convo
+            const trigger = wake.options.trigger ? `:${wake.options.trigger}` : ''
+            console.log(`[computer] ${this.agent.id} SSE ${evt.event}${trigger} received${convo ? ` convo=${convo}` : ''}${backgroundBrief ? ` brief=${backgroundBrief.source ?? 'manual'}` : ''}${deliveryMs != null ? ` deliveryLatency=${deliveryMs}ms` : ''}`)
+            this.scheduleWake(`sse-${evt.event}${trigger}`, convo, backgroundBrief)
+          }
+          // 'ready' is a no-op keepalive.
+        }
+        // The stream ended WITHOUT throwing — a clean server-side close. This
+        // used to fall straight back to the loop head and re-fetch with ZERO
+        // delay, re-firing reconnect-catchup every pass: measured at ~15k
+        // requests/second against the API from the operator's own machine.
+        if (!this.stopped) {
+          console.warn(`[computer] ${this.agent.id} wake-stream closed by server · retry in ${backoff}ms`)
+        }
+      } catch (err) {
+        if (this.stopped) break
+        const _cause = (err as { cause?: { code?: string; message?: string } } | null)?.cause
+        console.warn(`[computer] ${this.agent.id} stream error: ${err instanceof Error ? err.message : err}${_cause ? ` cause=${_cause.code ?? _cause.message ?? JSON.stringify(_cause)}` : ''} · retry in ${backoff}ms`)
+      }
+      this.streamLastSeenAt = null
+      if (this.streamAbort === abort) this.streamAbort = null
+      if (this.stopped) break
+      // BOTH exits back off. Reset the ladder only after a connection that
+      // actually stayed up — a 200 that closes immediately must not reset it, or
+      // the delay can never grow away from a pathological endpoint.
+      if (wakeStreamWasStable(connectedAt === null ? null : Date.now() - connectedAt)) backoff = 1000
+      await new Promise((r) => setTimeout(r, backoff))
+      backoff = Math.min(backoff * 2, 30_000)
+    }
+  }
+}
+
+// ─── run loop ───────────────────────────────────────────────────────────
+
+/** Prefix every daemon log line with an ISO-8601 timestamp so the service log
+ *  (~/.cumora/daemon.log) is diagnosable: when a wake arrived, how long a turn
+ *  took, etc. Only for the long-running daemon (doRun) — the one-shot
+ *  --status/--version/--logs commands stay clean. */
+/** Cap ~/.cumora/daemon.log so it can't fill the disk. The supervisor (launchd /
+ *  systemd) holds the file open in APPEND mode, so we can't rename it (that would
+ *  orphan its fd and silently stop logging). Instead we copy-truncate (logrotate's
+ *  copytruncate): keep the last full chunk as daemon.log.1, then truncate the live
+ *  file IN PLACE — same inode, the supervisor keeps appending to it. Total stays
+ *  ~2×MAX. Best-effort and silent when there's no file (a foreground run). */
+async function rotateLogsIfNeeded(): Promise<void> {
+  try {
+    const logPath = join(CONFIG_DIR, 'daemon.log')
+    const st = await stat(logPath)
+    if (st.size <= MAX_LOG_BYTES) return
+    await copyFile(logPath, `${logPath}.1`)
+    await truncate(logPath, 0)
+    console.log(`[computer] daemon.log passed ${Math.round(MAX_LOG_BYTES / 1048576)}MB — rotated (kept daemon.log.1, truncated live log)`)
+  } catch { /* no log file (foreground) or transient FS error — never crash the daemon */ }
+}
+
+function installTimestampedLogging(): void {
+  const wrap = (fn: (...a: unknown[]) => void): typeof fn => (...a: unknown[]) => fn(new Date().toISOString(), ...a)
+  console.log = wrap(console.log.bind(console)) as typeof console.log
+  console.warn = wrap(console.warn.bind(console)) as typeof console.warn
+  console.error = wrap(console.error.bind(console)) as typeof console.error
+}
+
+async function doRun(serverOverride?: string): Promise<void> {
+  installTimestampedLogging()
+  if (allowUnsandboxedByoa()) {
+    console.warn('[computer] SECURITY WARNING: CUMORA_BYOA_ALLOW_UNSANDBOXED=1 — local model engines may read host files, inherit credentials, and use the network')
+  } else {
+    for (const name of [
+      'CUMORA_CLAUDE_ARGS', 'CUMORA_CODEX_ARGS', 'CUMORA_GROK_ARGS',
+      'CUMORA_CURSOR_ARGS', 'CUMORA_OPENCODE_ARGS', 'CUMORA_PI_ARGS',
+      'CUMORA_GEMINI_ARGS', 'CUMORA_TRIAGE_ARGS',
+    ]) {
+      if (process.env[name]) console.warn(`[computer] ignoring ${name}: custom engine argv requires CUMORA_BYOA_ALLOW_UNSANDBOXED=1`)
+    }
+  }
+  // Global safety net: a long-running daemon hosting every one of the user's
+  // agents must NOT die because one async path threw — a transient 502 from a
+  // server pod rolling, a network blip, a malformed event. Node ≥15 turns an
+  // unhandled rejection into a fatal exit by default; an uncaught exception is
+  // fatal too. We log and KEEP RUNNING so the agents stay online and self-heal
+  // on the next wake / poll. Installed once, here at the top of the run loop.
+  process.on('unhandledRejection', (reason) => {
+    console.error('[computer] unhandledRejection (kept alive):', reason instanceof Error ? reason.stack || reason.message : reason)
+  })
+  process.on('uncaughtException', (err) => {
+    console.error('[computer] uncaughtException (kept alive):', err instanceof Error ? err.stack || err.message : err)
+  })
+
+  const cfg = await loadConfig()
+  if (!cfg) {
+    console.error('[computer] not paired. Run: cumora agent computer --pair <code> [--server <url>]')
+    process.exitCode = 1
+    return
+  }
+  if (serverOverride) cfg.serverUrl = serverOverride
+  // Resolve the server preference before engine discovery so every adapter
+  // sees the same mode. Offline restarts fall back to the last saved value.
+  await syncUnsandboxedPreference(cfg)
+  let initialEngines: EngineId[]
+  try {
+    initialEngines = [...(await requireLocalEngine()).runnable]
+  } catch (err) {
+    console.error(`[computer] ${err instanceof Error ? err.message : String(err)}`)
+    process.exitCode = 70
+    return
+  }
+  const engineInventory: EngineInventory = { current: initialEngines }
+  console.log(`[computer] cumora ${CURRENT_VERSION} · starting ${cfg.computerId} @ ${cfg.serverUrl} (engines: ${engineInventory.current.join(', ')})`)
+  // Record what THIS process is running, keyed by pid, so `--status` can report
+  // the version of the live service instance reliably (cross-checked against the
+  // running pid — survives log rotation, no log-scraping).
+  const windowsShutdownRequest = process.platform === 'win32'
+    ? windowsShutdownRequestPath(process.pid)
+    : null
+  if (windowsShutdownRequest) await rm(windowsShutdownRequest, { force: true }).catch(() => {})
+  await writeRunningState()
+  if (!SUPERVISED) {
+    console.log(`[computer] 💡 tip: run \`npx cumora@latest agent computer --install-service\` to keep this running in the background — auto-start when you sign in, auto-restart on crash, and auto-update. (This terminal must stay open otherwise.)`)
+  }
+
+  const runners = new Map<string, AgentRunner>()
+  const codexMigrationFailures = new Map<string, { message: string; reported: Set<string>; token: string; tokenExpiresAt: number }>()
+  const engineInventoryStabilizer = new EngineInventoryStabilizer()
+
+  const syncOnce = async (): Promise<void> => {
+    let agents: AgentInfo[]
+    try {
+      agents = await api<AgentInfo[]>(cfg.serverUrl, '/api/computers/me/agents?providerProfiles=1', {
+        headers: { Authorization: `Bearer ${cfg.deviceToken}` },
+      })
+    } catch (err) {
+      console.warn('[computer] agent sync failed:', err instanceof Error ? err.message : err)
+      return
+    }
+    const available = engineInventory.current
+    let profiles: ProviderProfile[] = []
+    try { profiles = readProviderProfiles(join(CONFIG_DIR, 'providers.json')) }
+    catch (err) { console.warn('[computer]', (err as Error).message) }
+    for (const agent of agents) {
+      const provider = profiles.find((p) => p.id === agent.providerProfile)
+      // A bound profile must never fall through to another engine or account.
+      const engine = agent.providerProfile
+        ? (provider && !allowUnsandboxedByoa() && (agent.engine === 'claude' || agent.engine === 'api') && available.includes(agent.engine) ? agent.engine : null)
+        : resolveAvailableEngine(agent.engine, available.filter(e=>e!=='api'))
+      if (agent.providerProfile && !engine) console.warn(`[computer] provider unavailable for ${agent.id}; runner stopped`)
+      if (!engine) {
+        // A successful rescan may legitimately find that the last installed CLI
+        // was removed. Stop an existing runner instead of leaving it alive on an
+        // engine this machine no longer has.
+        const existing = runners.get(agent.id)
+        if (existing) {
+          console.log(`[computer] no installed engine remains for ${agent.name} (${agent.id}) → stopping runner`)
+          runners.delete(agent.id)
+          await existing.stop({ forceEngine: true })
+        }
+        continue
+      }
+      const existing = runners.get(agent.id)
+      if (existing) {
+        if (existing.configMatches(agent, engine, provider)) continue
+        // Engine/model/persona was edited in Cumora — restart the runner so the
+        // change takes effect on the next wake without a daemon restart.
+        console.log(`[computer] agent ${agent.name} (${agent.id}) config changed → restarting on ${engine}`)
+        runners.delete(agent.id)
+        await existing.stop({ forceEngine: true })
+      }
+      if (engine === 'codex') {
+        try {
+          // Migrate before creating a runner or broker. A missing transcript
+          // pauses only this agent; retry on the next sync without log spam.
+          await migrateCodexSession(agent.id)
+          codexMigrationFailures.delete(agent.id)
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err)
+          const remedy = `Restore the rollout in the original Codex home, or run \`${CODEX_MIGRATE_COMMAND}\` with CODEX_HOME set to that home. Migration retries automatically.`
+          let failure = codexMigrationFailures.get(agent.id)
+          if (!failure || failure.message !== message) {
+            failure = { message, reported: new Set(), token: '', tokenExpiresAt: 0 }
+            codexMigrationFailures.set(agent.id, failure)
+            console.error(`[computer] ${agent.id} paused: ${message} ${remedy}`)
+          }
+          try {
+            if (!failure.token || Date.now() >= failure.tokenExpiresAt - TOKEN_REFRESH_SKEW_MS) {
+              const { token, expiresInSeconds } = await api<{ token: string; expiresInSeconds: number }>(cfg.serverUrl, `/api/agents/${agent.id}/runtime-token`, {
+                method: 'POST', headers: { Authorization: `Bearer ${cfg.deviceToken}` },
+                body: JSON.stringify({ providerProfile: agent.providerProfile ?? null }),
+              })
+              failure.token = token
+              failure.tokenExpiresAt = Date.now() + expiresInSeconds * 1000
+            }
+            const { token, reported } = failure
+            const conversationIds = await failureConversationIds(cfg.serverUrl, token, null)
+            await Promise.all(conversationIds.filter(id => !reported.has(id)).map(async conversationId => {
+              const result = await runtimeBest(cfg.serverUrl, '/notices', token, {
+                conversationId,
+                noticeKind: 'byoa_engine_failed',
+                text: `${agent.name} is paused because its Codex session could not be migrated: ${conciseError(message).split(homedir()).join('~')}\n${remedy}`,
+                dedupeKey: `codex_migration_failed:${agent.id}:${conversationId}:${hashText(message)}`,
+                dedupeTtlSec: 900,
+              })
+              if (result !== null) reported.add(conversationId)
+            }))
+          } catch { /* Retry notification on the next sync without blocking other agents. */ }
+          continue
+        }
+      }
+      const runner = new AgentRunner(cfg, agent, engine, provider)
+      runners.set(agent.id, runner)
+      console.log(`[computer] hosting agent ${agent.name} (${agent.id}) on ${engine}`)
+      await runner.start()
+    }
+    // Agents removed from this computer: stop their runners.
+    const live = new Set(agents.map((a) => a.id))
+    for (const id of codexMigrationFailures.keys()) {
+      if (!live.has(id)) codexMigrationFailures.delete(id)
+    }
+    for (const [id, runner] of runners) {
+      if (!live.has(id)) {
+        runners.delete(id)
+        await runner.stop({ forceEngine: true, purgeAttachments: true })
+      }
+    }
+  }
+
+  // Poll ticks and reconnects can overlap. Serialize reconciliation so a later
+  // pass cannot create a replacement while the prior pass is still awaiting
+  // termination of that Agent's old process tree.
+  let syncInFlight: Promise<void> | null = null
+  const sync = (): Promise<void> => {
+    if (syncInFlight) return syncInFlight
+    const running = syncOnce().finally(() => {
+      if (syncInFlight === running) syncInFlight = null
+    })
+    syncInFlight = running
+    return running
+  }
+
+  // Last snapshot we successfully described to the server, as a JSON fingerprint.
+  let lastEngineSnapshot = ''
+  let lastCapabilityWarning = ''
+
+  // Engines this machine can currently run, re-scanned on a slow timer. Reported
+  // on every heartbeat so installing another supported CLI takes effect without
+  // re-pairing — the daemon is already online and can see PATH itself, so there
+  // is no reason to make the user mint a new pairing token for it.
+  const scanEnginesOnce = async (forceReport: boolean): Promise<void> => {
+    try {
+      const detected = await detectEnginesWithStatus()
+      if (!detected.reliable) return  // broken `which` / `where` — keep the last good list
+      const evaluated = await evaluateRunnableEngines(detected.engines)
+      const next = engineInventoryStabilizer.stabilize(engineInventory.current, detected.engines, evaluated)
+      const blocked = evaluated.blocked.filter(({ id }) => !next.includes(id))
+      const retainedTransient = [...new Set([
+        ...evaluated.temporarilyUnverifiable ?? [],
+        ...evaluated.blocked.filter(({ id, state }) => state === 'temporarily-unverifiable' && next.includes(id)).map(({ id }) => id),
+      ])]
+      const capabilityWarning = [
+        ...blocked.map(({ id, reason }) => `${id} (${reason})`),
+        ...retainedTransient.map((id) => `${id} (version temporarily unverifiable; retaining last-known-good availability)`),
+      ].join('; ')
+      if (capabilityWarning !== lastCapabilityWarning) {
+        lastCapabilityWarning = capabilityWarning
+        if (capabilityWarning) console.warn(`[computer] secure engine capability update: ${capabilityWarning}`)
+      }
+      const previous = engineInventory.current
+      const changed = replaceEngineInventory(engineInventory, next)
+      if (changed) {
+        console.log(`[computer] engines on PATH changed: ${previous.join(', ') || 'none'} → ${next.join(', ') || 'none'}`)
+      }
+      // Heartbeat already advertises the live inventory. This snapshot is
+      // only the PATH display the app reads — pairable engines, never the
+      // detect-only bins Electron lists on the Me page. It carries each
+      // engine's version *as installed on this machine*: the app renders it
+      // verbatim and never probes its own PATH, because whoever is looking at
+      // the card is usually not sitting at the machine it describes.
+      // Blocked engines ride along as extra display rows carrying the reason
+      // they were refused. Until now that reason existed only as the
+      // console.warn above — on a machine the operator is usually not sitting
+      // at — so an engine could disappear from the card with no explanation
+      // anywhere they could see. They stay OUT of `next`: that list becomes
+      // available_engines and picks an agent's adapter.
+      const blockedIds = blocked.map(({ id }) => id)
+      // One enrich over the whole list: it maps entry-by-entry, so splitting it
+      // bought nothing and only risked the two halves drifting apart.
+      const snapshot = await enrichDetectedEngines([
+        ...await snapshotDetectedEngines(next),
+        ...await blockedSnapshotRows(blocked),
+      ], forceReport)
+      // Report on version drift too, not just install/uninstall — upgrading an
+      // engine in place leaves the engine *list* identical, and that is exactly
+      // when the card's version line goes stale. The blocked reasons are part
+      // of the fingerprint: fixing the cause (upgrading the CLI, installing
+      // bwrap) has to clear the card, not wait for an unrelated change.
+      let profiles: ProviderProfile[] = []
+      try { profiles = readProviderProfiles(join(CONFIG_DIR, 'providers.json')) }
+      catch (err) { console.warn('[computer]', (err as Error).message) }
+      const advertisedSnapshot = snapshot.map((entry) => (entry.id === 'claude' || entry.id === 'api')
+        ? { ...entry, providerProfiles: allowUnsandboxedByoa() ? [] : profiles.map(providerProfileMetadata) } : entry)
+      const fingerprint = JSON.stringify(advertisedSnapshot)
+      lastEngineSnapshot = await reportEngineSnapshot(
+        fingerprint,
+        lastEngineSnapshot,
+        forceReport,
+        () => api(cfg.serverUrl, '/api/computers/me/engines', {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${cfg.deviceToken}` },
+          body: JSON.stringify({ engines: next, detected: advertisedSnapshot, blocked: blockedIds }),
+        }),
+      )
+      // This is the same live inventory sync() uses to choose an agent's
+      // adapter. Updating only a heartbeat cache would advertise a newly
+      // installed engine while silently running that agent on the old default.
+    } catch (err) {
+      // Transient — the next tick retries, and that is now true of the report
+      // above too. Say so anyway: a scan failing every five minutes for a
+      // non-transient reason used to leave no trace anywhere.
+      console.warn('[computer] engine scan failed:', err instanceof Error ? err.message : err)
+    }
+  }
+
+  // Timer/startup/requested scans can land together. Share an in-flight scan;
+  // if a forced request arrives during it, run once more so its acknowledgement
+  // cannot be swallowed by the older scan finishing afterward.
+  const rescanEngines = createEngineRescanQueue(scanEnginesOnce)
+
+  const heartbeat = async (): Promise<void> => {
+    try {
+      const response = await fetch(`${cfg.serverUrl}/api/computers/heartbeat`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${cfg.deviceToken}` },
+        // A heartbeat that never answers must not outlive its own interval, or
+        // the beats queue up behind a dead socket and the computer reads offline.
+        signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
+        // `supervised` tells the server HOW this daemon runs (service vs. a
+        // foreground command), so the app's upgrade banner can show the right
+        // update instructions for this machine.
+        body: JSON.stringify({ version: CURRENT_VERSION, supervised: SUPERVISED, unsandboxed: allowUnsandboxedByoa(), engines: engineInventory.current }),
+      })
+      if (!response.ok) return
+      const heartbeatResult = await response.json().catch(() => null) as { detectRequested?: boolean; unsandboxedEnabled?: boolean | null } | null
+      if (typeof heartbeatResult?.unsandboxedEnabled === 'boolean' && heartbeatResult.unsandboxedEnabled !== allowUnsandboxedByoa()) {
+        // A toggle made while this daemon was offline is picked up here. A
+        // supervised daemon exits and is relaunched with the saved config;
+        // foreground daemons keep running safely until the operator restarts.
+        if (cfg.unsandboxed !== heartbeatResult.unsandboxedEnabled) {
+          cfg.unsandboxed = heartbeatResult.unsandboxedEnabled
+          await saveConfig(cfg)
+          if (SUPERVISED) console.warn('[computer] security mode changed while offline; restarting to apply it')
+          else console.warn('[computer] security mode changed while offline; restart this foreground daemon to apply it')
+          if (SUPERVISED) {
+            if (restartForSecurityMode) restartForSecurityMode(!heartbeatResult.unsandboxedEnabled)
+            else {
+              securityModeRestartPending = true
+              securityModeRestartImmediate = !heartbeatResult.unsandboxedEnabled
+            }
+          }
+        }
+      }
+      if (heartbeatResult?.detectRequested) void rescanEngines(true)
+    } catch { /* transient — next tick retries */ }
+  }
+
+  let securityModeRestartPending = false
+  let securityModeRestartImmediate = false
+  let restartForSecurityMode: ((immediate: boolean) => void) | null = null
+
+  let shuttingDown = false
+  // Serialize control events; the server refuses a second pending update.
+  //
+  // shortcut: an update is not deferred until agents are idle, so on Windows it
+  // can lose to a CLI that is mid-turn (EPERM); the card then still reads
+  // outdated and the daemon log says why. Upgrade to an idle wait if that shows
+  // up in practice.
+  let updating = Promise.resolve()
+  const updateEngine = (id: string, requestId: string): Promise<void> => {
+    if (!ENGINE_IDS.includes(id as EngineId)) return updating
+    updating = updating.then(async () => {
+      const report = (status: 'running' | 'succeeded' | 'failed', error?: string) =>
+        api(cfg.serverUrl, `/api/computers/me/engine-updates/${encodeURIComponent(requestId)}`, {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${cfg.deviceToken}` },
+          body: JSON.stringify({ status, error }),
+        })
+      // Claim before starting: another stream/process must not run this twice.
+      try { await report('running') }
+      catch (err) {
+        console.warn(`[computer] ${id} update was not accepted:`, err instanceof Error ? err.message : err)
+        return
+      }
+      let result: { ok: boolean; error?: string }
+      try {
+        const entry = (await snapshotDetectedEngines([id as EngineId]))[0]
+        const updated = await runEngineUpdate(id, entry?.path ?? null)
+        result = updated
+        if (!updated.ok) console.warn(`[computer] ${id} update failed (${updated.command}): ${updated.error}`)
+        else console.log(`[computer] ${id} updated: ${updated.command}`)
+      } catch (err) {
+        result = { ok: false, error: err instanceof Error ? err.message : String(err) }
+        console.warn(`[computer] ${id} update failed:`, result.error)
+      }
+      await rescanEngines(true).catch(() => {})
+      await report(result.ok ? 'succeeded' : 'failed', result.error)
+    }).catch((err) => {
+      console.warn(`[computer] ${id} update result could not be reported:`, err instanceof Error ? err.message : err)
+    })
+    return updating
+  }
+  const controlStreamAbort = new AbortController()
+  const controlStreamLoop = async (): Promise<void> => {
+    let backoff = 1000
+    while (!shuttingDown) {
+      let connectedAt: number | null = null
+      try {
+        const response = await fetch(`${cfg.serverUrl}/api/computers/me/control-stream`, {
+          headers: { Authorization: `Bearer ${cfg.deviceToken}`, Accept: 'text/event-stream' },
+          signal: controlStreamAbort.signal,
+        })
+        if (!response.ok || !response.body) throw new Error(`computer control-stream HTTP ${response.status}`)
+        connectedAt = Date.now()
+        console.log('[computer] control-stream connected')
+        for await (const event of parseSseStream(response.body as unknown as AsyncIterable<unknown>)) {
+          if (shuttingDown) break
+          if (event.event === 'ready') {
+            // Pick up a durable request that may have been persisted while this
+            // stream was disconnected, without waiting for the next 30s tick.
+            void heartbeat()
+            continue
+          }
+          const signal = event.data ? parseComputerControlEvent(event.data) : null
+          if (signal?.kind === 'engine.detect') void rescanEngines(true)
+          else if (signal?.kind === 'engine.update') void updateEngine(signal.engine, signal.id)
+          else if (signal?.kind === 'security.mode') {
+            cfg.unsandboxed = signal.unsandboxed
+            await saveConfig(cfg)
+            if (SUPERVISED) void shutdown('security mode change', !signal.unsandboxed)
+            else console.warn('[computer] security mode saved; restart this foreground daemon with `npx cumora@latest agent computer` to apply it (press Ctrl-C first)')
+          }
+        }
+        if (!shuttingDown) console.warn(`[computer] control-stream closed by server · retry in ${backoff}ms`)
+      } catch (error) {
+        if (shuttingDown || controlStreamAbort.signal.aborted) break
+        console.warn(`[computer] control-stream error: ${error instanceof Error ? error.message : String(error)} · retry in ${backoff}ms`)
+      }
+      if (shuttingDown) break
+      if (wakeStreamWasStable(connectedAt === null ? null : Date.now() - connectedAt)) backoff = 1000
+      await new Promise((resolve) => setTimeout(resolve, backoff))
+      backoff = Math.min(backoff * 2, 30_000)
+    }
+  }
+
+  await heartbeat()
+  await sync()
+  if (runners.size === 0) {
+    console.log('[computer] no agents assigned to this computer yet. Assign one in Cumora; polling…')
+  }
+  const poll = setInterval(() => { void sync() }, AGENT_POLL_MS)
+  const beat = setInterval(() => { void heartbeat() }, HEARTBEAT_MS)
+  const rescan = setInterval(() => { void rescanEngines() }, ENGINE_RESCAN_MS)
+  rescan.unref?.()
+  // Pairing reports a cheap paths-only snapshot so the user is not kept waiting
+  // on CLI spawns. Fill in the versions right after startup instead of leaving
+  // the card blank until the first 5-minute tick.
+  void rescanEngines()
+  void controlStreamLoop()
+  // Keep the service log from filling the disk: rotate at boot, then periodically.
+  void rotateLogsIfNeeded()
+  const logrot = setInterval(() => { void rotateLogsIfNeeded() }, LOG_ROTATE_MS)
+  logrot.unref?.()
+
+  let upd: ReturnType<typeof setInterval> | undefined
+  let idleWatch: ReturnType<typeof setInterval> | undefined
+  let controlWatch: ReturnType<typeof setInterval> | undefined
+  const anyBusy = (): boolean => [...runners.values()].some((r) => r.isBusy)
+
+  // Graceful shutdown: stop accepting new wakes, give any in-flight turn a brief
+  // window to FINISH (so it persists its session id + finalizes its run) before we
+  // kill the engine child. A long task won't finish in the window and gets killed,
+  // but its session id is on disk → the relaunched daemon `--resume`s it.
+  const shutdown = async (why: string, immediate = false): Promise<void> => {
+    if (shuttingDown) return
+    shuttingDown = true
+    controlStreamAbort.abort()
+    clearInterval(poll); clearInterval(beat); clearInterval(logrot); clearInterval(rescan)
+    if (upd) clearInterval(upd)
+    if (idleWatch) clearInterval(idleWatch)
+    if (controlWatch) clearInterval(controlWatch)
+    if (windowsShutdownRequest) await rm(windowsShutdownRequest, { force: true }).catch(() => {})
+    for (const runner of runners.values()) runner.beginStop() // no new turns; leave in-flight running
+    const deadline = Date.now() + SHUTDOWN_GRACE_MS
+    if (anyBusy() && !immediate) console.log(`[computer] ${why}: waiting up to ${Math.round(SHUTDOWN_GRACE_MS / 1000)}s for in-flight turn(s) to finish…`)
+    while (!immediate && anyBusy() && Date.now() < deadline) await new Promise((r) => setTimeout(r, 500))
+    // process.exit() follows immediately, so engine-specific delayed fallbacks
+    // cannot run. Force each child to receive its termination signal first.
+    await Promise.all([...runners.values()].map((runner) => runner.stop({ forceEngine: true })))
+    console.log(`[computer] shutting down (${why})`)
+    process.exit(0)
+  }
+  restartForSecurityMode = (immediate) => { void shutdown('security mode change', immediate) }
+  if (securityModeRestartPending) restartForSecurityMode(securityModeRestartImmediate)
+  process.on('SIGINT', () => { void shutdown('SIGINT') })
+  process.on('SIGTERM', () => { void shutdown('SIGTERM') })
+  if (windowsShutdownRequest) {
+    controlWatch = setInterval(() => {
+      if (existsSync(windowsShutdownRequest)) void shutdown('service control')
+    }, 250)
+    controlWatch.unref?.()
+  }
+
+  // Self-update: compare to npm's latest periodically. When supervised
+  // (--install-service), a clean exit relaunches the service on cumora@latest =
+  // the update. Crucially we do NOT interrupt a live turn for a (non-urgent)
+  // update: once an update is detected we wait for ALL agents to go idle, then
+  // exit. First check a minute after boot, then every UPDATE_CHECK_MS.
+  let updateReady = false
+  const exitForUpdateWhenIdle = (): void => {
+    if (!updateReady || shuttingDown) return
+    if (anyBusy()) return // mid-turn — defer; the idle watch retries
+    void shutdown('auto-update')
+  }
+  const runUpdateCheck = (): void => {
+    void checkForUpdate(() => {
+      if (!updateReady) {
+        updateReady = true
+        console.log('[computer] update ready — will restart to apply it as soon as all agents are idle')
+      }
+      exitForUpdateWhenIdle()
+    })
+  }
+  upd = setInterval(runUpdateCheck, UPDATE_CHECK_MS)
+  idleWatch = setInterval(exitForUpdateWhenIdle, 30_000); idleWatch.unref?.()
+  setTimeout(runUpdateCheck, 60_000).unref?.()
+}
+
+// ─── self-update + service ────────────────────────────────────────────────
+
+/** Compare the running version to npm's `latest`. If behind: when supervised,
+ *  exit cleanly so the service relaunches on `cumora@latest` (= the update);
+ *  otherwise just log that an update is available. Never throws. */
+async function checkForUpdate(onSupervisedUpdate: () => void): Promise<void> {
+  try {
+    const res = await fetch('https://registry.npmjs.org/cumora/latest', { headers: { Accept: 'application/json' } })
+    if (!res.ok) return
+    const latest = (await res.json() as { version?: string })?.version
+    if (typeof latest !== 'string' || !versionGt(latest, CURRENT_VERSION)) return
+    if (SUPERVISED) {
+      console.log(`[computer] 🆕 cumora ${latest} available (running ${CURRENT_VERSION}) — will restart to apply once idle (in-flight turns are never interrupted for an update)`)
+      onSupervisedUpdate()
+    } else {
+      console.log(`[computer] 🆕 cumora ${latest} available (running ${CURRENT_VERSION}). Restart to update, or run \`cumora agent computer --install-service\` for auto-updates.`)
+    }
+  } catch { /* offline / npm hiccup — try the next tick */ }
+}
+
+/** Absolute path to npx next to the node that's running us, so the supervisor
+ *  doesn't depend on its (minimal) PATH resolving `npx`. Falls back to PATH. */
+export function resolveNpx(
+  platform: NodeJS.Platform = process.platform,
+  execPath = process.execPath,
+): string {
+  const executable = platform === 'win32' ? 'npx.cmd' : 'npx'
+  const sibling = join(dirname(execPath), executable)
+  return existsSync(sibling) ? sibling : executable
+}
+
+function windowsSupervisorPath(): string {
+  return join(CONFIG_DIR, 'daemon-supervisor.ps1')
+}
+
+function windowsSupervisorLauncherPath(): string {
+  return join(CONFIG_DIR, 'daemon-supervisor.vbs')
+}
+
+function windowsSupervisorDisabledPath(): string {
+  return join(CONFIG_DIR, 'daemon-supervisor.disabled')
+}
+
+function windowsShutdownRequestPath(pid: number): string {
+  return join(CONFIG_DIR, `shutdown-${pid}.request`)
+}
+
+function quotePowerShell(value: string): string {
+  return `'${value.replaceAll("'", "''")}'`
+}
+
+/** The scheduled task starts this watchdog at login. It deliberately restarts
+ *  after every daemon exit, including the clean exit used to apply an update. */
+export function renderWindowsSupervisor(
+  npx: string,
+  serverUrl: string,
+  logPath: string,
+  disabledPath = windowsSupervisorDisabledPath(),
+  path = process.env.PATH ?? '',
+  // Carried only when the machine has nothing runnable without it — see
+  // _needsUnsandboxedOptIn. Dropping it makes the supervised daemon exit 70 on
+  // every start, and this loop restarts it every 5 seconds forever.
+  carryUnsandboxed = false,
+): string {
+  return [
+    "$ErrorActionPreference = 'Continue'",
+    "$env:CUMORA_SUPERVISED = '1'",
+    ...(carryUnsandboxed ? ["$env:CUMORA_BYOA_ALLOW_UNSANDBOXED = '1'"] : []),
+    `$env:PATH = ${quotePowerShell(path)}`,
+    '$utf8 = New-Object System.Text.UTF8Encoding($false)',
+    `while (-not (Test-Path -LiteralPath ${quotePowerShell(disabledPath)})) {`,
+    `  & ${quotePowerShell(npx)} -y cumora@latest agent computer --server ${quotePowerShell(serverUrl)} 2>&1 | ForEach-Object {`,
+    `    [System.IO.File]::AppendAllText(${quotePowerShell(logPath)}, ([string]$_ + [Environment]::NewLine), $utf8)`,
+    '  }',
+    '  Start-Sleep -Seconds 5',
+    '}',
+    '',
+  ].join('\r\n')
+}
+
+function quoteVbScript(value: string): string {
+  return `"${value.replaceAll('"', '""')}"`
+}
+
+/** Task Scheduler's interactive PowerShell action can still acquire a visible
+ *  Windows Terminal host on Windows 11, even with `-WindowStyle Hidden`. Launch
+ *  through the GUI-subsystem wscript.exe instead; WScript.Shell.Run's window
+ *  style 0 keeps PowerShell and its watchdog process tree hidden from birth. */
+export function renderWindowsSupervisorLauncher(scriptPath: string): string {
+  const command = `powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File "${scriptPath.replaceAll('"', '""')}"`
+  return [
+    'Set shell = CreateObject("WScript.Shell")',
+    // Wait for the watchdog so Task Scheduler keeps the task in Running state
+    // and refuses duplicate /Run requests while this supervisor is alive.
+    `shell.Run ${quoteVbScript(command)}, 0, True`,
+    '',
+  ].join('\r\n')
+}
+
+export function windowsScheduledTaskCommand(launcherPath: string): string {
+  return `wscript.exe //B //Nologo "${launcherPath.replaceAll('"', '""')}"`
+}
+
+export function windowsScheduledTaskCreateArgs(
+  launcherPath: string,
+  taskName = windowsTaskName(),
+): string[] {
+  return [
+    '/Create', '/TN', taskName,
+    '/TR', windowsScheduledTaskCommand(launcherPath),
+    '/SC', 'ONLOGON', '/RL', 'LIMITED', '/IT', '/F',
+  ]
+}
+
+export function windowsScheduledTaskSettingsCommand(taskName = windowsTaskName()): string {
+  return `$settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable; Set-ScheduledTask -TaskName ${quotePowerShell(taskName)} -Settings $settings | Out-Null`
+}
+
+export function windowsScheduledTaskQueryCommand(taskName = windowsTaskName()): string {
+  return `try { Get-ScheduledTask -TaskName ${quotePowerShell(taskName)} -ErrorAction Stop | Out-Null; exit 0 } catch { if ($_.FullyQualifiedErrorId -like 'CmdletizationQuery_NotFound_TaskName,*') { exit 3 }; Write-Error $_; exit 1 }`
+}
+
+async function isWindowsTaskInstalled(taskName = windowsTaskName()): Promise<boolean> {
+  try {
+    await execFileP('powershell.exe', [
+      '-NoProfile', '-NonInteractive', '-Command', windowsScheduledTaskQueryCommand(taskName),
+    ])
+    return true
+  } catch (err) {
+    if (String((err as { code?: number | string }).code) === '3') return false
+    throw err
+  }
+}
+
+/** Install a per-user supervisor (LaunchAgent on macOS, systemd --user on
+ *  Linux, Task Scheduler on Windows) that runs
+ *  `npx -y cumora@latest agent computer --server <url>` with auto-restart +
+ *  start-at-login. `@latest` + restart-on-update is what makes the daemon
+ *  self-update (see checkForUpdate). Must be paired first. */
+/** Does the supervised daemon need the unsandboxed compatibility opt-in to
+ *  start at all?
+ *
+ *  The service definitions carry only PATH and CUMORA_SUPERVISED, so an opt-in
+ *  that was set in the shell is dropped at install time. For a user whose only
+ *  engine is a compatibility one (grok, cursor, gemini, qwen, opencode, pi,
+ *  antigravity) that is fatal and silent: pairing succeeds in the foreground,
+ *  the daemon then prints "run --install-service to keep this running", and the
+ *  service it installs starts with an empty runnable set, exits 70, and is
+ *  restarted forever by KeepAlive / Restart=always / Task Scheduler.
+ *
+ *  Answered by asking the real gate with the flag removed, so the flag is only
+ *  ever persisted when dropping it would actually break the service — not
+ *  baked into a background service because it happened to be set in the shell
+ *  of someone whose secure engines were fine all along. */
+export async function _needsUnsandboxedOptIn(env: NodeJS.ProcessEnv = process.env): Promise<boolean> {
+  if (!allowUnsandboxedByoa(env)) return false
+  try {
+    const detected = await detectEnginesWithStatus()
+    if (!detected.reliable || detected.engines.length === 0) return false
+    const without = { ...env, CUMORA_BYOA_ALLOW_UNSANDBOXED: '' }
+    const evaluated = await evaluateRunnableEngines(detected.engines, without)
+    return evaluated.runnable.length === 0
+  } catch {
+    // Never let the probe stop an install. Not carrying the flag is the
+    // status quo, and --status/--logs will show the exit 70 if it matters.
+    return false
+  }
+}
+
+async function installService(serverUrl: string): Promise<void> {
+  if (!(await loadConfig())) {
+    throw new Error('pair this computer first: cumora agent computer --pair <code>')
+  }
+  const npx = resolveNpx()
+  const logPath = join(CONFIG_DIR, 'daemon.log')
+  await mkdir(CONFIG_DIR, { recursive: true })
+  const carryUnsandboxed = await _needsUnsandboxedOptIn()
+  if (carryUnsandboxed) {
+    console.warn('[computer] this machine has no secure engine, so the background service will')
+    console.warn('[computer] carry CUMORA_BYOA_ALLOW_UNSANDBOXED=1 — without it the service exits 70')
+    console.warn('[computer] on every start. Local engines may read host files and use the network.')
+    console.warn('[computer] To undo: cumora agent computer --uninstall-service')
+  }
+
+  if (process.platform === 'darwin') {
+    const dir = join(homedir(), 'Library', 'LaunchAgents')
+    await mkdir(dir, { recursive: true })
+    const plistPath = join(dir, `${SERVICE_LABEL}.plist`)
+    const args = [npx, '-y', 'cumora@latest', 'agent', 'computer', '--server', serverUrl]
+    const plist = `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>${SERVICE_LABEL}</string>
+  <key>ProgramArguments</key><array>${args.map((a) => `<string>${a}</string>`).join('')}</array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>${logPath}</string>
+  <key>StandardErrorPath</key><string>${logPath}</string>
+  <key>EnvironmentVariables</key><dict>
+    <key>PATH</key><string>${process.env.PATH ?? ''}</string>
+    <key>CUMORA_SUPERVISED</key><string>1</string>${carryUnsandboxed ? '\n    <key>CUMORA_BYOA_ALLOW_UNSANDBOXED</key><string>1</string>' : ''}
+  </dict>
+</dict></plist>
+`
+    await writeFile(plistPath, plist, 'utf8')
+    await execFileP('launchctl', ['unload', plistPath]).catch(() => { /* not loaded yet */ })
+    await execFileP('launchctl', ['load', plistPath])
+    console.log(`[computer] installed LaunchAgent ${SERVICE_LABEL} — auto-start, auto-restart, auto-update. Logs: ${logPath}`)
+    console.log(`[computer] you can now close this terminal; the service is running in the background.`)
+    return
+  }
+
+  if (process.platform === 'linux') {
+    const dir = join(homedir(), '.config', 'systemd', 'user')
+    await mkdir(dir, { recursive: true })
+    const unitPath = join(dir, 'cumora.service')
+    const unit = `[Unit]
+Description=Cumora BYOA daemon
+After=network-online.target
+
+[Service]
+ExecStart=${npx} -y cumora@latest agent computer --server ${serverUrl}
+Restart=always
+RestartSec=5
+Environment=PATH=${process.env.PATH ?? ''}
+Environment=CUMORA_SUPERVISED=1${carryUnsandboxed ? '\nEnvironment=CUMORA_BYOA_ALLOW_UNSANDBOXED=1' : ''}
+
+[Install]
+WantedBy=default.target
+`
+    await writeFile(unitPath, unit, 'utf8')
+    await execFileP('systemctl', ['--user', 'daemon-reload'])
+    await execFileP('systemctl', ['--user', 'enable', '--now', 'cumora'])
+    console.log(`[computer] installed systemd --user service 'cumora' — auto-start, auto-restart, auto-update. Logs: journalctl --user -u cumora -f`)
+    return
+  }
+
+  if (process.platform === 'win32') {
+    const scriptPath = windowsSupervisorPath()
+    const launcherPath = windowsSupervisorLauncherPath()
+    const disabledPath = windowsSupervisorDisabledPath()
+    const taskName = windowsTaskName()
+    const replacing = await isWindowsTaskInstalled(taskName)
+    await writeFile(scriptPath, renderWindowsSupervisor(npx, serverUrl, logPath, disabledPath, process.env.PATH ?? '', carryUnsandboxed), 'utf8')
+    await writeFile(launcherPath, renderWindowsSupervisorLauncher(scriptPath), 'utf8')
+    try {
+      // Always recreate with /F: an existing task may still point at the old
+      // direct-PowerShell action, so merely replacing the scripts is not enough.
+      await execFileP('schtasks.exe', windowsScheduledTaskCreateArgs(launcherPath, taskName))
+      await execFileP('powershell.exe', [
+        '-NoProfile', '-NonInteractive', '-Command', windowsScheduledTaskSettingsCommand(taskName),
+      ])
+    } catch (err) {
+      if (!replacing) {
+        try {
+          await execFileP('schtasks.exe', ['/Delete', '/TN', taskName, '/F'])
+        } catch (rollbackErr) {
+          throw new Error(`scheduled task setup failed and rollback could not delete '${taskName}'; the watchdog script was kept in place (${rollbackErr instanceof Error ? rollbackErr.message : String(rollbackErr)})`, { cause: err })
+        }
+        await rm(scriptPath, { force: true }).catch(() => {})
+        await rm(launcherPath, { force: true }).catch(() => {})
+      }
+      throw err
+    }
+    await writeFile(disabledPath, '', 'utf8')
+    await killRunningDaemons()
+    await stopWindowsWatchdog(taskName)
+    // The old watchdog could have spawned a daemon between the first process
+    // sweep and its own exit. Sweep once more only after it cannot relaunch one.
+    await killRunningDaemons()
+    await rm(disabledPath, { force: true })
+    try {
+      await execFileP('schtasks.exe', ['/Run', '/TN', taskName])
+    } catch (err) {
+      throw new Error(`scheduled task installed but could not be started; retry with --restart (${err instanceof Error ? err.message : String(err)})`)
+    }
+    console.log(`[computer] installed scheduled task '${taskName}' — start-at-login, auto-restart, auto-update. Logs: ${logPath}`)
+    console.log(`[computer] you can now close this terminal; the task is running in the background.`)
+    return
+  }
+
+  throw new Error(`--install-service is not supported on ${process.platform}`)
+}
+
+async function uninstallService(): Promise<void> {
+  if (process.platform === 'darwin') {
+    const plistPath = join(homedir(), 'Library', 'LaunchAgents', `${SERVICE_LABEL}.plist`)
+    await execFileP('launchctl', ['unload', plistPath]).catch(() => { /* already gone */ })
+    await rm(plistPath).catch(() => { /* already gone */ })
+    console.log(`[computer] removed LaunchAgent ${SERVICE_LABEL}`)
+    return
+  }
+  if (process.platform === 'linux') {
+    await execFileP('systemctl', ['--user', 'disable', '--now', 'cumora']).catch(() => { /* already gone */ })
+    await rm(join(homedir(), '.config', 'systemd', 'user', 'cumora.service')).catch(() => { /* already gone */ })
+    await execFileP('systemctl', ['--user', 'daemon-reload']).catch(() => {})
+    console.log(`[computer] removed systemd --user service 'cumora'`)
+    return
+  }
+  if (process.platform === 'win32') {
+    const taskName = windowsTaskName()
+    const disabledPath = windowsSupervisorDisabledPath()
+    await mkdir(CONFIG_DIR, { recursive: true })
+    await writeFile(disabledPath, '', 'utf8')
+    if (await isWindowsTaskInstalled(taskName)) {
+      await execFileP('schtasks.exe', ['/Delete', '/TN', taskName, '/F'])
+    }
+    await killRunningDaemons()
+    await stopWindowsWatchdog(taskName)
+    await killRunningDaemons()
+    if (await isWindowsTaskInstalled(taskName)) {
+      throw new Error(`scheduled task '${taskName}' still exists after deletion`)
+    }
+    await rm(windowsSupervisorPath(), { force: true })
+    await rm(windowsSupervisorLauncherPath(), { force: true })
+    // Keep this sentinel on every failed stop path so a surviving watchdog
+    // cannot revive a daemon after the command has reported an error.
+    await rm(disabledPath, { force: true })
+    console.log(`[computer] removed scheduled task '${taskName}'`)
+    return
+  }
+  throw new Error(`--uninstall-service is not supported on ${process.platform}`)
+}
+
+function darwinPlistPath(): string {
+  return join(homedir(), 'Library', 'LaunchAgents', `${SERVICE_LABEL}.plist`)
+}
+function linuxUnitPath(): string {
+  return join(homedir(), '.config', 'systemd', 'user', 'cumora.service')
+}
+
+/** Is the background supervisor already installed on this machine? */
+async function isServiceInstalled(): Promise<boolean> {
+  if (process.platform === 'darwin') return existsSync(darwinPlistPath())
+  if (process.platform === 'linux') return existsSync(linuxUnitPath())
+  if (process.platform === 'win32') return isWindowsTaskInstalled()
+  return false
+}
+
+/** Restart the already-installed service so it re-reads computer.json — used
+ *  after a re-pair so the running service adopts the new config instead of a
+ *  second foreground daemon racing it. */
+async function reloadService(): Promise<void> {
+  if (process.platform === 'darwin') {
+    const p = darwinPlistPath()
+    await execFileP('launchctl', ['unload', p]).catch(() => {})
+    await execFileP('launchctl', ['load', p])
+    return
+  }
+  if (process.platform === 'linux') {
+    await execFileP('systemctl', ['--user', 'restart', 'cumora'])
+    return
+  }
+  if (process.platform === 'win32') {
+    const taskName = windowsTaskName()
+    const disabledPath = windowsSupervisorDisabledPath()
+    await mkdir(CONFIG_DIR, { recursive: true })
+    await writeFile(disabledPath, '', 'utf8')
+    await killRunningDaemons()
+    await stopWindowsWatchdog(taskName)
+    await killRunningDaemons()
+    await rm(disabledPath, { force: true })
+    await execFileP('schtasks.exe', ['/Run', '/TN', taskName])
+  }
+}
+
+/** `--restart`: a friendly wrapper so users don't have to remember
+ *  `launchctl kickstart …`. Restarts the installed service (which relaunches on
+ *  cumora@latest, so it's also the "apply the update now" button). */
+interface RestartServiceHooks {
+  platform?: NodeJS.Platform
+  isServiceInstalled?: () => Promise<boolean>
+  loadConfig?: () => Promise<DaemonConfig | null>
+  installService?: (serverUrl: string) => Promise<void>
+  reloadService?: () => Promise<void>
+}
+
+export async function restartService(hooks: RestartServiceHooks = {}): Promise<void> {
+  const platform = hooks.platform ?? process.platform
+  const serviceInstalled = hooks.isServiceInstalled ?? isServiceInstalled
+  if (!(await serviceInstalled())) {
+    console.log('[computer] service not installed — run: npx cumora@latest agent computer --install-service')
+    return
+  }
+  if (platform === 'win32') {
+    const cfg = await (hooks.loadConfig ?? loadConfig)()
+    if (!cfg) throw new Error('pair this computer first: cumora agent computer --pair <code>')
+    await (hooks.installService ?? installService)(cfg.serverUrl)
+    console.log('[computer] Windows service refreshed and restarted — its supervisor now launches cumora@latest')
+  } else if (platform === 'darwin') {
+    const uid = process.getuid?.() ?? 0
+    try {
+      await execFileP('launchctl', ['kickstart', '-k', `gui/${uid}/${SERVICE_LABEL}`])
+    } catch {
+      await (hooks.reloadService ?? reloadService)() // not currently loaded → load it
+    }
+  } else if (platform === 'linux') {
+    await (hooks.reloadService ?? reloadService)()
+  } else {
+    throw new Error(`--restart is not supported on ${platform}`)
+  }
+  if (platform !== 'win32') {
+    console.log('[computer] service restarted — it relaunches on cumora@latest (also applies any pending update). Check: npx cumora@latest agent computer --status')
+  }
+}
+
+/** `--stop`: stop the background service NOW, without uninstalling it. The job is
+ *  removed from the supervisor so KeepAlive/Restart won't relaunch it; the
+ *  plist/unit stays on disk, so `--restart` brings it back. (To remove it
+ *  entirely, use `--uninstall-service`.) */
+
+/** One-shot CLI invocations: these do a thing and exit, so they are never the
+ *  long-running daemon we mean to stop. Anchored to the `--` so the words can't
+ *  match incidentally elsewhere in the command line. */
+export const ONE_SHOT_FLAGS = [
+  'stop', 'status', 'restart', 'logs', 'version', 'install-service',
+  'uninstall-service', 'pair', 'doctor', 'provider', 'help',
+  'codex-login', 'migrate-codex-sessions',
+] as const
+const ONE_SHOT_FLAG_RE = new RegExp(`--(?:${ONE_SHOT_FLAGS.join('|')})\\b`)
+
+/** `--doctor` and `--help` also answer to bare `doctor` / `help` (parseArgs
+ *  accepts both spellings), and those forms carry no `--` to anchor on. Anchor
+ *  them to the command instead of matching the bare word, so a path like
+ *  /opt/doctor-tools/ still reads as a daemon — the same rule the `--`
+ *  anchoring exists for. */
+const ONE_SHOT_SUBCOMMAND_RE = /\bagent computer (?:doctor|help)\b/
+
+/** Is this `ps`-reported command line a long-running BYOA daemon that `--stop`
+ *  should kill? True only for `agent computer` with no one-shot flag.
+ *
+ *  The npx *wrapper* used to be excluded here too, but that exclusion was both
+ *  wrong and unnecessary: `npx -y cumora@latest agent computer --server …` is
+ *  exactly how the LaunchAgent (and the docs) start a real daemon, and self/parent
+ *  protection is already handled by dropping process.pid / process.ppid from the
+ *  candidate set. Killing the wrapper's child is what actually stops the daemon,
+ *  and the wrapper exits with it. */
+export function isStoppableDaemonCommand(cmd: string): boolean {
+  if (!isCumoraAgentCommand(cmd)) return false
+  return !ONE_SHOT_FLAG_RE.test(cmd) && !ONE_SHOT_SUBCOMMAND_RE.test(cmd)
+}
+
+/** Is this `ps`-reported command line one of ours at all? Weaker than
+ *  `isStoppableDaemonCommand` on purpose: it says nothing about whether the
+ *  process is the long-running daemon, only that a pid we already have other
+ *  evidence for has not been recycled by some unrelated program. */
+export function isCumoraAgentCommand(cmd: string): boolean {
+  return /agent computer/.test(cmd)
+}
+
+async function commandLineForPid(pid: number): Promise<string> {
+  if (process.platform === 'win32') {
+    const command = `(Get-CimInstance Win32_Process -Filter "ProcessId = ${pid}" -ErrorAction SilentlyContinue).CommandLine`
+    return (await execFileP('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', command])).stdout.trim()
+  }
+  return (await execFileP('ps', ['-p', String(pid), '-o', 'command='])).stdout.trim()
+}
+
+interface WindowsProcessInfo {
+  ProcessId: number
+  CommandLine: string
+  Name?: string
+}
+
+export function parseWindowsProcessList(output: string): WindowsProcessInfo[] {
+  if (!output.trim()) return []
+  const parsed = JSON.parse(output) as WindowsProcessInfo | WindowsProcessInfo[]
+  return (Array.isArray(parsed) ? parsed : [parsed]).filter((item) =>
+    Number.isInteger(item?.ProcessId) && item.ProcessId > 0 && typeof item.CommandLine === 'string')
+}
+
+async function windowsDaemonProcesses(): Promise<WindowsProcessInfo[]> {
+  const command = [
+    '$OutputEncoding = [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)',
+    `@(Get-CimInstance Win32_Process -ErrorAction Stop | Where-Object { $_.CommandLine -match 'agent\\s+computer' } | Select-Object ProcessId, CommandLine) | ConvertTo-Json -Compress`,
+  ].join('; ')
+  const { stdout } = await execFileP('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', command])
+  return parseWindowsProcessList(stdout)
+}
+
+async function windowsSupervisorProcesses(): Promise<WindowsProcessInfo[]> {
+  const command = [
+    '$OutputEncoding = [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)',
+    `@(Get-CimInstance Win32_Process -ErrorAction Stop | Where-Object { ($_.Name -ieq 'powershell.exe' -or $_.Name -ieq 'pwsh.exe') -and $_.CommandLine -match 'daemon-supervisor\\.ps1' } | Select-Object ProcessId, CommandLine, Name) | ConvertTo-Json -Compress`,
+  ].join('; ')
+  const { stdout } = await execFileP('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', command])
+  return parseWindowsProcessList(stdout).filter((item) => isWindowsSupervisorProcess(item))
+}
+
+export function isWindowsSupervisorProcess(
+  item: WindowsProcessInfo,
+  scriptPath = windowsSupervisorPath(),
+): boolean {
+  if (!item.Name || !['powershell.exe', 'pwsh.exe'].includes(item.Name.toLowerCase())) return false
+  const match = item.CommandLine.match(/(?:^|\s)-File\s+(?:"([^"]+)"|(\S+))(?:\s|$)/i)
+  const invokedScript = match?.[1] ?? match?.[2]
+  return invokedScript?.toLowerCase() === scriptPath.toLowerCase()
+}
+
+async function stopWindowsWatchdog(taskName: string): Promise<void> {
+  await execFileP('schtasks.exe', ['/End', '/TN', taskName]).catch(() => { /* deleted/already stopped */ })
+  const deadline = Date.now() + 2_000
+  let watchdogs = await windowsSupervisorProcesses()
+  while (watchdogs.length > 0 && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 100))
+    watchdogs = await windowsSupervisorProcesses()
+  }
+  for (const watchdog of watchdogs) {
+    await execFileP('taskkill.exe', ['/PID', String(watchdog.ProcessId), '/T', '/F']).catch(() => {})
+  }
+  const forceDeadline = Date.now() + 2_000
+  watchdogs = await windowsSupervisorProcesses()
+  while (watchdogs.length > 0 && Date.now() < forceDeadline) {
+    await new Promise((resolve) => setTimeout(resolve, 100))
+    watchdogs = await windowsSupervisorProcesses()
+  }
+  if (watchdogs.length > 0) {
+    throw new Error(`Windows watchdog process(es) still running: ${watchdogs.map((item) => item.ProcessId).join(', ')}`)
+  }
+}
+
+/** Stop any RUNNING daemon process — the supervised one (after the service is
+ *  uninstalled), a foreground one, or a stray/orphaned one. Sources: the pid the
+ *  daemon records in running.json, plus an OS process sweep for "agent computer". We
+ *  verify each candidate's command line really is a long-running daemon (and is
+ *  NOT this --stop command or another one-shot CLI) before stopping it. Windows
+ *  uses a per-PID request file for graceful shutdown, then taskkill /T as the
+ *  bounded fallback so engine descendants cannot be orphaned. */
+async function killRunningDaemons(): Promise<void> {
+  const candidates = new Set<number>()
+  let recordedPid: number | null = null
+  try {
+    const pid = (JSON.parse(await readFile(RUNNING_STATE_PATH, 'utf8')) as { pid?: number }).pid
+    if (typeof pid === 'number' && pid > 0) { candidates.add(pid); recordedPid = pid }
+  } catch { /* no pid file */ }
+  if (process.platform === 'win32') {
+    for (const item of await windowsDaemonProcesses()) candidates.add(item.ProcessId)
+  } else {
+    try {
+      const { stdout } = await execFileP('pgrep', ['-f', 'agent computer'])
+      for (const l of stdout.split('\n')) { const p = parseInt(l.trim(), 10); if (p > 0) candidates.add(p) }
+    } catch { /* none / pgrep unavailable */ }
+  }
+  candidates.delete(process.pid)
+  if (typeof process.ppid === 'number') candidates.delete(process.ppid)
+
+  // running.json is written by `doRun` itself, so a pid recorded there HAS
+  // become the long-running daemon whatever its flags say. That matters because
+  // one real daemon's command line does carry a one-shot flag: `--pair` on a
+  // machine with no service installed pairs and then falls through to `doRun`,
+  // which is the whole first-run onboarding path. Judging it by its flags left
+  // `--stop` reporting "daemon process(es) killed" while that daemon kept
+  // running, kept claiming agent turns, and could only be stopped by closing the
+  // terminal. For that pid we only re-confirm it is still one of ours, so a
+  // stale file whose pid the OS has recycled cannot make us kill a stranger.
+  //
+  // Every other candidate comes from a bare pgrep and carries no such evidence,
+  // so it keeps the strict rule — a sibling one-shot CLI must never be killed.
+  const isVictimCommand = (pid: number, cmd: string): boolean =>
+    pid === recordedPid ? isCumoraAgentCommand(cmd) : isStoppableDaemonCommand(cmd)
+
+  const victims: number[] = []
+  for (const pid of candidates) {
+    try {
+      if (isVictimCommand(pid, await commandLineForPid(pid))) victims.push(pid)
+    } catch { /* gone */ }
+  }
+  if (process.platform === 'win32') {
+    if (victims.length > 0) await mkdir(CONFIG_DIR, { recursive: true })
+    for (const pid of victims) {
+      await writeFile(windowsShutdownRequestPath(pid), 'stop\n', 'utf8').catch(() => {})
+    }
+    const deadline = Date.now() + SHUTDOWN_GRACE_MS + 2_000
+    let survivors = victims
+    while (survivors.length > 0 && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 250))
+      const next: number[] = []
+      for (const pid of survivors) {
+        try {
+          if (isVictimCommand(pid, await commandLineForPid(pid))) next.push(pid)
+        } catch { /* exited */ }
+      }
+      survivors = next
+    }
+    for (const pid of survivors) {
+      await execFileP('taskkill.exe', ['/PID', String(pid), '/T', '/F']).catch(() => {})
+    }
+    for (const pid of victims) await rm(windowsShutdownRequestPath(pid), { force: true }).catch(() => {})
+    const forceDeadline = Date.now() + 2_000
+    const stillRunning = async (): Promise<WindowsProcessInfo[]> =>
+      (await windowsDaemonProcesses()).filter((item) =>
+        item.ProcessId !== process.pid && item.ProcessId !== process.ppid &&
+        isVictimCommand(item.ProcessId, item.CommandLine))
+    let remaining = await stillRunning()
+    while (remaining.length > 0 && Date.now() < forceDeadline) {
+      await new Promise((resolve) => setTimeout(resolve, 100))
+      remaining = await stillRunning()
+    }
+    if (remaining.length > 0) {
+      throw new Error(`Windows daemon process(es) still running: ${remaining.map((item) => item.ProcessId).join(', ')}`)
+    }
+  } else {
+    for (const pid of victims) { try { process.kill(pid, 'SIGTERM') } catch { /* gone */ } }
+    if (victims.length > 0) {
+      await new Promise((r) => setTimeout(r, 1500))
+      for (const pid of victims) { try { process.kill(pid, 0); process.kill(pid, 'SIGKILL') } catch { /* already exited */ } }
+    }
+  }
+  if (victims.length > 0) {
+    console.log(`[computer] stopped ${victims.length} running daemon process(es)`)
+  }
+  await rm(RUNNING_STATE_PATH, { force: true }).catch(() => {})
+}
+
+/** `--stop`: a FULL stop — uninstall the background service (so the supervisor
+ *  can't relaunch it) AND kill any daemon process still running. After this the
+ *  agents are fully offline until you re-pair / re-install. */
+async function stopService(): Promise<void> {
+  if (process.platform === 'win32') {
+    // Always clean up on Windows: a manually deleted task may still have left a
+    // watchdog process or script behind, and that watchdog can relaunch a daemon.
+    await uninstallService()
+  } else if (await isServiceInstalled()) {
+    await uninstallService() // removes the plist/unit + unloads → kills the supervised process
+  } else {
+    console.log('[computer] no background service installed — killing any running daemon process directly.')
+  }
+  if (process.platform !== 'win32') await killRunningDaemons()
+  console.log('[computer] stopped — service removed and daemon process(es) killed. Re-pair to start again: npx cumora@latest agent computer --pair <code>')
+}
+
+/** `--status`: a one-glance summary — version, pairing, whether the background
+ *  service is installed + running (PID / last exit), and where the logs are. */
+async function printStatus(): Promise<void> {
+  const cfg = await loadConfig()
+  // The version of the binary running THIS command. May differ from what the
+  // background service is actually running (it auto-updates on its own cycle),
+  // so we report the service's running version separately, read from its log.
+  console.log(`cli:     cumora ${CURRENT_VERSION} (this command)`)
+  console.log(cfg ? `paired:  computer ${cfg.computerId} @ ${cfg.serverUrl}` : 'paired:  NO — run: npx cumora@latest agent computer --pair <code>')
+  if (!(await isServiceInstalled())) {
+    console.log('service: not installed — run: npx cumora@latest agent computer --install-service')
+    return
+  }
+  let livePid: number | null = null
+  if (process.platform === 'darwin') {
+    try {
+      const { stdout } = await execFileP('launchctl', ['list', SERVICE_LABEL])
+      const pid = stdout.match(/"PID"\s*=\s*(\d+)/)?.[1]
+      livePid = pid ? Number(pid) : null
+      const exit = stdout.match(/"LastExitStatus"\s*=\s*(-?\d+)/)?.[1]
+      console.log(livePid ? `service: installed · running (pid ${livePid})` : `service: installed · NOT running${exit ? ` (last exit ${exit})` : ''}`)
+    } catch {
+      console.log('service: installed · not loaded (try: launchctl load ~/Library/LaunchAgents/' + SERVICE_LABEL + '.plist)')
+    }
+  } else if (process.platform === 'linux') {
+    const active = await execFileP('systemctl', ['--user', 'is-active', 'cumora']).then((r) => r.stdout.trim()).catch(() => 'inactive')
+    const pid = await execFileP('systemctl', ['--user', 'show', 'cumora', '-p', 'MainPID', '--value']).then((r) => r.stdout.trim()).catch(() => '')
+    livePid = pid && pid !== '0' ? Number(pid) : null
+    console.log(`service: installed · ${active}${livePid ? ` (pid ${livePid})` : ''}`)
+  } else if (process.platform === 'win32') {
+    try {
+      const state = JSON.parse(await readFile(RUNNING_STATE_PATH, 'utf8')) as { pid?: number }
+      if (typeof state.pid === 'number' && isStoppableDaemonCommand(await commandLineForPid(state.pid))) {
+        livePid = state.pid
+      }
+    } catch { /* task is between restarts or has not started yet */ }
+    console.log(livePid
+      ? `service: installed · running (pid ${livePid}, Task Scheduler)`
+      : `service: installed · registered in Task Scheduler`)
+  }
+  const running = await resolveRunningVersion(livePid)
+  if (running) {
+    console.log(`running: cumora ${running}${running === CURRENT_VERSION ? ' (latest)' : ' (differs from this cli — `npx cumora@latest agent computer --restart` to pick up the latest)'}`)
+  } else {
+    console.log('running: unknown — `npx cumora@latest agent computer --restart` to (re)start it and record the version')
+  }
+  console.log(`logs:    ${process.platform === 'linux' ? 'journalctl --user -u cumora -f' : join(CONFIG_DIR, 'daemon.log')}  (or: npx cumora@latest agent computer --logs)`)
+}
+
+const RUNNING_STATE_PATH = join(CONFIG_DIR, 'running.json')
+
+/** On startup the live daemon records {version, pid, startedAt} here so
+ *  `--status` can report the running instance's exact version — verified by pid
+ *  so a stale file (from a since-exited process) is ignored. */
+async function writeRunningState(): Promise<void> {
+  try {
+    await mkdir(CONFIG_DIR, { recursive: true })
+    await writeFile(RUNNING_STATE_PATH, JSON.stringify({ version: CURRENT_VERSION, pid: process.pid, startedAt: new Date().toISOString() }), 'utf8')
+  } catch { /* best-effort; --status falls back to the log */ }
+}
+
+/** The version the SERVICE is running right now. Primary source: running.json,
+ *  trusted only when its recorded pid IS the live service pid (so it reflects
+ *  THIS instance, not a stale one). Fallback: the latest startup line in the log
+ *  (works for builds that log a version but predate running.json). '' if unknown
+ *  (e.g. the running build predates both — restart it once to record it). */
+async function resolveRunningVersion(livePid: number | null): Promise<string> {
+  try {
+    const st = JSON.parse(await readFile(RUNNING_STATE_PATH, 'utf8')) as { version?: string; pid?: number }
+    if (typeof st.version === 'string' && st.version && livePid != null && st.pid === livePid) return st.version
+  } catch { /* no/again-bad state file — fall back to log scan */ }
+  try {
+    const text = process.platform === 'linux'
+      ? (await execFileP('journalctl', ['--user', '-u', 'cumora', '-n', '400', '--no-pager'])).stdout
+      : await readFile(join(CONFIG_DIR, 'daemon.log'), 'utf8')
+    const m = [...text.matchAll(/cumora (\d+\.\d+\.\d+) · starting/g)]
+    return m.length ? m[m.length - 1][1] : ''
+  } catch { return '' }
+}
+
+/** `--logs`: follow the service's output. macOS/Windows tail the log file;
+ *  Linux streams journald (systemd doesn't write a file). Runs until Ctrl+C. */
+async function tailLogs(): Promise<void> {
+  if (process.platform === 'linux') {
+    await new Promise<void>((resolve) => {
+      const c = spawn('journalctl', ['--user', '-u', 'cumora', '-n', '100', '-f'], { stdio: 'inherit' })
+      c.on('close', () => resolve()); c.on('error', () => resolve())
+    })
+    return
+  }
+  const logPath = join(CONFIG_DIR, 'daemon.log')
+  if (!existsSync(logPath)) {
+    console.log(`no log at ${logPath} yet — is the service installed and running? (npx cumora@latest agent computer --status)`)
+    return
+  }
+  await new Promise<void>((resolve) => {
+    const c = process.platform === 'win32'
+      ? spawn('powershell.exe', [
+          '-NoProfile', '-NonInteractive', '-Command',
+          `Get-Content -LiteralPath ${quotePowerShell(logPath)} -Encoding UTF8 -Tail 100 -Wait`,
+        ], { stdio: 'inherit' })
+      : spawn('tail', ['-n', '100', '-f', logPath], { stdio: 'inherit' })
+    c.on('close', () => resolve()); c.on('error', () => resolve())
+  })
+}
+
+// ─── doctor ─────────────────────────────────────────────────────────────
+
+/** Which engines could actually carry a wake right now.
+ *
+ *  Brain health is necessary but not sufficient. `requireLocalEngine` also
+ *  refuses to start the daemon when no installed engine can enforce the BYOA
+ *  boundary — an unsandboxed engine without the opt-in, or a secure one below
+ *  its version floor. Scoring the doctor on brain health alone printed a green
+ *  verdict and exit 0 on machines where `--pair` exits 70.
+ *
+ *  `runnable` is null when the gate could not be evaluated at all (PATH scan
+ *  failed). The diagnostic must not become a crash, so that degrades to the
+ *  older brain-only answer rather than declaring everything unusable. */
+export function doctorUsableEngines(
+  results: ReadonlyArray<{
+    id: EngineId
+    installed: boolean
+    big?: { ok: boolean } | null
+    small?: { ok: boolean } | null
+  }>,
+  runnable: { runnable: readonly EngineId[] } | null,
+): EngineId[] {
+  return results
+    .filter((r) => r.installed && r.big?.ok === true && r.small?.ok === true)
+    .map((r) => r.id)
+    .filter((id) => runnable === null || runnable.runnable.includes(id))
+}
+
+/** `cumora agent computer --doctor`: diagnose every local engine on this
+ *  machine — is it installed, and are its BIG brain (main reasoning) and SMALL
+ *  brain (the triage cerebellum) reachable + authed? Each tier gets a trivial
+ *  one-shot probe over the SAME spawn path real wakes use. Pure local: no
+ *  cloud, no DB, no pairing required.
+ *
+ *  Brain health is necessary but NOT sufficient, and the verdict used to be
+ *  drawn from it alone. `requireLocalEngine` also refuses to start the daemon
+ *  when no installed engine can enforce the BYOA boundary — an unsandboxed
+ *  engine without the opt-in, or a secure one below its version floor. On a
+ *  machine in that state the doctor printed a green verdict and exit 0 while
+ *  `--pair` exited 70, which is the worst possible advice for the person who
+ *  ran the diagnostic precisely because something was already wrong. So the
+ *  verdict now asks the same gate the daemon does, and an engine only counts
+ *  when it is both healthy AND runnable. */
+async function runDoctor(providerId?: string): Promise<void> {
+  const provider = providerId !== undefined
+    ? readProviderProfiles(join(CONFIG_DIR, 'providers.json')).find((p) => p.id === providerId) : undefined
+  if (providerId !== undefined && !provider) throw new Error('provider profile not found in providers.json')
+  console.log(`cumora ${CURRENT_VERSION} · engine doctor`)
+  console.log('probing local engines (big brain = main reasoning, small brain = triage cerebellum)…\n')
+
+  const results = await runEngineDoctor({
+    env: provider ? providerProfileEnv(process.env, provider) : undefined,
+    engines: provider ? ['claude'] : undefined,
+    onLog: (l) => console.error(`  · ${redactProviderSecret(l, provider)}`),
+  })
+  for (const result of results) {
+    for (const health of [result.big, result.small, result.wake]) {
+      if (health) health.detail = redactProviderSecret(health.detail, provider)
+    }
+  }
+  console.log('')
+
+  // Ask the same gate the daemon does. A healthy brain on an engine this
+  // machine is not allowed to run is not a machine that can run an agent.
+  const runnable = await (async () => {
+    try {
+      const detected = await detectEnginesWithStatus()
+      if (!detected.reliable || detected.engines.length === 0) return null
+      return await evaluateRunnableEngines(detected.engines)
+    } catch {
+      // The gate is advisory HERE — never let it turn a diagnostic into a
+      // crash. Falling back to null keeps the old brain-only verdict.
+      return null
+    }
+  })()
+
+  let anyUsable = false
+  for (const r of results) {
+    if (!r.installed) {
+      console.log(`✖ ${r.id} — not found on PATH`)
+      // The binary is not always the engine id — cursor ships `cursor-agent`,
+      // antigravity ships `agy`. missingEngineMessage() in this file gets that
+      // right; this line used to contradict it.
+      console.log(r.id === 'codex'
+        ? `    install the \`codex\` CLI, run \`${CODEX_LOGIN_COMMAND}\`, then re-run --doctor\n`
+        : `    install the \`${getAdapter(r.id)?.bin ?? r.id}\` CLI and run it once to sign in, then re-run --doctor\n`)
+      continue
+    }
+    console.log(`● ${r.id} — ${r.path}`)
+    for (const [label, h] of [['big brain  ', r.big], ['small brain', r.small]] as const) {
+      if (!h) continue
+      if (h.ok) {
+        console.log(`    ✓ ${label}  ok (${h.ms}ms)`)
+      } else {
+        console.log(`    ✖ ${label}  FAILED (${h.ms}ms): ${h.detail}`)
+        console.log(`        → ${authFailureHint(r.id, h.detail)}`)
+      }
+    }
+    // Wake-path line. Hidden when skipped (the wake collapses to one-shot exec on
+    // this machine — the brain probes above already cover that shape, so a wake
+    // line would be noise). Failure is shown but NOT counted against "anyUsable"
+    // because run()'s one-shot exec is a working fallback whenever the wake-path
+    // breaks — the user just doesn't get persistent-session benefits.
+    if (r.wake && !r.wake.skipped) {
+      if (r.wake.ok) {
+        console.log(`    ✓ wake path   ok (${r.wake.ms}ms)`)
+      } else {
+        console.log(`    ⚠ wake path   FAILED (${r.wake.ms}ms): ${r.wake.detail}`)
+        console.log(`        → persistent-session path unavailable; agents will fall back to one-shot exec`)
+      }
+    }
+    const blockedReason = runnable?.blocked.find((b) => b.id === r.id)?.reason
+    if (blockedReason) {
+      console.log(`    ✖ not runnable  ${blockedReason}`)
+      console.log('        → healthy brains, but the daemon will refuse to start on this engine')
+    }
+    console.log('')
+  }
+  anyUsable = doctorUsableEngines(results, runnable).length > 0
+
+  if (!anyUsable) {
+    console.log('✖ no engine is both healthy and runnable — this machine cannot currently run a BYOA agent.')
+    if (runnable && runnable.runnable.length === 0) {
+      // Print exactly what `--pair` would print, so the two never disagree.
+      const why = runnable.blocked.length > 0
+        ? incapableEngineMessage(runnable.blocked)
+        : sandboxedEngineMessage(ENGINE_IDS.filter((id) => results.some((r) => r.id === id && r.installed)))
+      console.log('')
+      for (const line of why.split('\n')) console.log(`  ${line}`)
+      console.log('')
+    }
+    console.log('  fix the failures above (usually: open the engine\'s app and sign in / refresh quota), then re-run:')
+    console.log('    cumora agent computer --doctor')
+    process.exitCode = 1
+  } else {
+    console.log('✓ at least one engine is healthy and runnable — BYOA agents on this machine can wake their brains.')
+  }
+}
+
+// ─── entry ──────────────────────────────────────────────────────────────
+
+export async function runComputerDaemon(argv: string[]): Promise<void> {
+  const args = parseArgs(argv)
+  if (args.provider !== undefined && !args.doctor) throw new Error('--provider requires --doctor')
+  const serverUrl = (args.server || DEFAULT_SERVER).replace(/\/+$/, '')
+  if (args.help) { console.log(helpText()); return }
+  if (args.version) { console.log(CURRENT_VERSION); return }
+  if (args.codexLogin) { await loginCodexRuntime(); return }
+  if (args.migrateCodexSessions) {
+    const agents = await migrateCodexSessions()
+    console.log(`Migrated ${agents.length} Codex session(s) to ${codexRuntimeHome()}${agents.length ? `: ${agents.join(', ')}` : ''}. Personal Codex data was left in place.`)
+    return
+  }
+  if (args.doctor) { await runDoctor(args.provider); return }
+  if (args.restart) { await restartService(); return }
+  if (args.stop) { await stopService(); return }
+  if (args.status) { await printStatus(); return }
+  if (args.logs) { await tailLogs(); return }
+  if (args.uninstallService) { await uninstallService(); return }
+  // Pair first (saves config) so a combined `--pair … --install-service` can
+  // pair AND hand off to the supervisor in one paste.
+  if (args.pair) {
+    await doPair(args.pair, serverUrl, args.engine)
+  }
+  // Installing the service is terminal: it writes the supervisor (which runs
+  // the daemon itself) and exits — we don't ALSO run a foreground daemon here.
+  if (args.installService) {
+    const cfg = await loadConfig()
+    await installService(args.server ? serverUrl : (cfg?.serverUrl ?? serverUrl))
+    return
+  }
+  // Re-paired on a machine already managed by the background service: reload
+  // the service so it adopts the new config (e.g. moved to another company),
+  // instead of starting a SECOND foreground daemon that races the service.
+  if (args.pair && await isServiceInstalled()) {
+    await reloadService()
+    console.log(`[computer] re-paired — reloaded the background service with the new config. (No foreground daemon needed; you can close this terminal.)`)
+    return
+  }
+  await doRun(args.server ? serverUrl : undefined)
+}

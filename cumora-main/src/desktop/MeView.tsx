@@ -1,0 +1,1514 @@
+import { useCallback, useEffect, useState } from 'react'
+import { useParticipants } from '@/stores/participants'
+import { useComputers } from '@/stores/computers'
+import { usePrefs } from '@/stores/preferences'
+import { useSoundStore } from '@/stores/sound'
+import { useDevtools } from '@/stores/devtools'
+import { useAuth } from '@/stores/auth'
+import { usePairingCodes } from '@/stores/pairing-codes'
+import { copyText } from '@/lib/clipboard'
+import { Avatar } from '@/components/Avatar'
+import { Checkbox } from '@/components/Checkbox'
+import { Combobox } from '@/components/Combobox'
+import { AppearancePicker, ChatLayoutPicker } from '@/components/AppearancePicker'
+import { LanguagePicker } from '@/components/LanguagePicker'
+import { useT, type MessageKey } from '@/lib/i18n'
+import { cn } from '@/lib/utils'
+import { api, getPairingServerOrigin, getServerOrigin, type ApiProject } from '@/api/client'
+import { ENGINE_BIN, ENGINE_LABEL, RUNNABLE_ENGINES, RUNNABLE_ENGINE_IDS, engineLabel, type RunnableEngineId } from '@/lib/engines'
+import type { Computer, EngineId, EngineModelCatalog } from '@/types'
+import { engineModelChoices, catalogTrust } from '@/lib/engine-model-choices'
+import { ENGINE_UPDATE_TTL_SECONDS } from '../../shared/engine-update'
+
+// The tab's identity is its `key`; the label is a message key resolved at
+// render. Before this they were the same string, which would have made
+// the active tab depend on the UI language.
+const tabs = [
+  { key: 'profile', label: 'me.tab.profile' },
+  { key: 'computers', label: 'me.tab.computers' },
+  { key: 'projects', label: 'me.tab.projects' },
+  { key: 'trust', label: 'me.tab.trust' },
+  { key: 'preferences', label: 'me.tab.preferences' },
+] as const satisfies ReadonlyArray<{ key: string; label: MessageKey }>
+type Tab = (typeof tabs)[number]['key']
+
+// `lbl` / `sub` are message keys — the preference `key` is the server-side
+// identifier and never changes with the language.
+const PREF_GROUPS: Array<{ title: MessageKey; items: Array<{ key: string; lbl: MessageKey; sub: MessageKey; default: boolean }> }> = [
+  {
+    title: 'me.prefs.notifications',
+    items: [
+      { key: 'notify.group_pulled', lbl: 'me.prefs.groupPulled', sub: 'me.prefs.groupPulledSub', default: true },
+      { key: 'notify.whisper_mention', lbl: 'me.prefs.whisperMention', sub: 'me.prefs.whisperMentionSub', default: true },
+      { key: 'notify.convene_called', lbl: 'me.prefs.conveneCalled', sub: 'me.prefs.conveneCalledSub', default: true },
+      { key: 'notify.daily_summary', lbl: 'me.prefs.dailySummary', sub: 'me.prefs.dailySummarySub', default: false },
+    ],
+  },
+  {
+    title: 'me.prefs.lookFeel',
+    items: [
+      { key: 'ui.reduce_motion', lbl: 'me.prefs.reduceMotion', sub: 'me.prefs.reduceMotionSub', default: false },
+      { key: 'ui.typing_indicators', lbl: 'me.prefs.typingIndicators', sub: 'me.prefs.typingIndicatorsSub', default: true },
+      { key: 'ui.thoughts_in_main', lbl: 'me.prefs.thoughtsInMain', sub: 'me.prefs.thoughtsInMainSub', default: false },
+    ],
+  },
+  {
+    title: 'me.prefs.privacy',
+    items: [
+      { key: 'priv.allow_silent_whispers', lbl: 'me.prefs.silentWhispers', sub: 'me.prefs.silentWhispersSub', default: true },
+      { key: 'priv.allow_new_tools', lbl: 'me.prefs.newTools', sub: 'me.prefs.newToolsSub', default: true },
+      { key: 'priv.allow_human_invites', lbl: 'me.prefs.humanInvites', sub: 'me.prefs.humanInvitesSub', default: false },
+    ],
+  },
+]
+
+function ProfileTab() {
+  // Pull both the auth user (real account: id, email, providers) and the
+  // matching participant (for avatar). They're usually the same person but
+  // participant rows can lag in the local cache, so we don't gate on it.
+  const t = useT()
+  const authUser = useAuth((s) => s.user)
+  const meParticipant = useParticipants((s) => (authUser ? s.byId[authUser.id] : null))
+  const serverOrigin = getServerOrigin() || 'same-origin (Vite proxy)'
+
+  async function signOut() {
+    // Server-side: revoke the session row so the token is dead even if it
+    // leaks. Best-effort — client clear still happens on network failure.
+    try { await api.authLogout() } catch (e) { console.warn('[signout] server call failed', e) }
+    useAuth.getState().clear()
+    location.reload()
+  }
+
+  if (!authUser) return null
+  const providers = authUser.providers ?? []
+  return (
+    <div className="space-y-6">
+      <Section title={t('me.sectionIdentity')}>
+        <div className="bg-cloud rounded-[14px] p-5 flex items-start gap-5"
+          style={{ border: '1px solid var(--ink-100)' }}>
+          {meParticipant
+            ? <Avatar p={meParticipant} size={88} />
+            : <div className="w-[88px] h-[88px] rounded-full bg-ink-100" />}
+          <div className="flex-1 min-w-0">
+            <h2 className="font-display font-medium text-[26px] tracking-tight truncate" style={{ letterSpacing: '-0.02em' }}>{authUser.name}</h2>
+            <div className="font-display italic text-[14px] text-ink-500 truncate">{authUser.email}</div>
+            <div className="flex items-center gap-2 mt-3 flex-wrap">
+              {providers.map((p) => (
+                <span key={p} className="text-[11px] uppercase tracking-wider px-2 py-0.5 rounded-full bg-paper text-ink-700" style={{ border: '1px solid var(--ink-100)' }}>
+                  {p}
+                </span>
+              ))}
+            </div>
+          </div>
+        </div>
+      </Section>
+
+      <Section title={t('me.sectionSession')}>
+        <div className="bg-cloud rounded-[14px] p-5 flex items-center justify-between gap-4"
+          style={{ border: '1px solid var(--ink-100)' }}>
+          <div className="min-w-0">
+            <div className="font-display text-[14px] text-ink-800">{t('me.sessionTitle', { server: serverOrigin })}</div>
+            <div className="font-display italic text-[12px] text-ink-400 mt-0.5">
+              {t('me.sessionHint')}
+            </div>
+          </div>
+          <button
+            type="button"
+            onClick={signOut}
+            className="shrink-0 h-9 px-4 rounded-[8px] bg-ink-800 hover:bg-ink-900 text-white text-[13px] font-display transition-colors"
+          >
+            {t('common.signOut')}
+          </button>
+        </div>
+      </Section>
+
+      <CommunitySection />
+
+      <AboutSection />
+    </div>
+  )
+}
+
+/** Discord invite. Renders on every platform (web + desktop) so feedback
+ *  has a single, advertised entry point that doesn't go through email. */
+function CommunitySection() {
+  const t = useT()
+  return (
+    <Section title={t('me.sectionCommunity')}>
+      <div className="bg-cloud rounded-[14px] p-5 flex items-center justify-between gap-4"
+        style={{ border: '1px solid var(--ink-100)' }}>
+        <div className="min-w-0">
+          <div className="font-display text-[14px] text-ink-800">{t('me.communityTitle')}</div>
+          <div className="font-display italic text-[12px] text-ink-400 mt-0.5">
+            {t('me.communityHint')}
+          </div>
+        </div>
+        <a
+          href="https://discord.gg/hzfcsB6vMr"
+          target="_blank"
+          rel="noopener noreferrer"
+          className="shrink-0 h-9 px-4 rounded-[8px] text-[13px] font-display transition-colors text-white inline-flex items-center gap-2"
+          style={{ background: '#5865F2' }}
+        >
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+            <path d="M20.317 4.3698a19.7913 19.7913 0 0 0-4.8851-1.5152.0741.0741 0 0 0-.0785.0371c-.211.3753-.4447.8648-.6083 1.2495-1.8447-.2762-3.68-.2762-5.4868 0-.1636-.3933-.4058-.8742-.6177-1.2495a.077.077 0 0 0-.0785-.037 19.7363 19.7363 0 0 0-4.8852 1.515.0699.0699 0 0 0-.0321.0277C.5334 9.0458-.319 13.5799.0992 18.0578a.0824.0824 0 0 0 .0312.0561c2.0528 1.5076 4.0413 2.4228 5.9929 3.0294a.0777.0777 0 0 0 .0842-.0276c.4616-.6304.8731-1.2952 1.226-1.9942a.076.076 0 0 0-.0416-.1057c-.6528-.2476-1.2743-.5495-1.8722-.8923a.077.077 0 0 1-.0076-.1277c.1258-.0943.2517-.1923.3718-.2914a.0743.0743 0 0 1 .0776-.0105c3.9278 1.7933 8.18 1.7933 12.0614 0a.0739.0739 0 0 1 .0785.0095c.1202.099.246.1981.3728.2924a.077.077 0 0 1-.0066.1276 12.2986 12.2986 0 0 1-1.873.8914.0766.0766 0 0 0-.0407.1067c.3604.698.7719 1.3628 1.225 1.9932a.076.076 0 0 0 .0842.0286c1.961-.6067 3.9495-1.5219 6.0023-3.0294a.077.077 0 0 0 .0313-.0552c.5004-5.177-.8382-9.6739-3.5485-13.6604a.061.061 0 0 0-.0312-.0286zM8.02 15.3312c-1.1825 0-2.1569-1.0857-2.1569-2.419 0-1.3332.9555-2.4189 2.157-2.4189 1.2108 0 2.1757 1.0952 2.1568 2.419 0 1.3332-.9555 2.4189-2.1569 2.4189zm7.9748 0c-1.1825 0-2.1569-1.0857-2.1569-2.419 0-1.3332.9554-2.4189 2.1569-2.4189 1.2108 0 2.1757 1.0952 2.1568 2.419 0 1.3332-.946 2.4189-2.1568 2.4189Z" />
+          </svg>
+          {t('me.joinDiscord')}
+        </a>
+      </div>
+    </Section>
+  )
+}
+
+/** Cumora version + auto-update entry point. Renders only when the
+ *  Electron bridge is available (PWA / web builds have no updater).
+ *  Click "Check for updates" → opens the UpdaterDialog mounted at the
+ *  AuthedApp level via a custom window event (avoids prop-drilling
+ *  through three layers of view components). */
+function AboutSection() {
+  const t = useT()
+  const [version, setVersion] = useState<string | null>(null)
+  const [supported, setSupported] = useState<boolean>(false)
+
+  useEffect(() => {
+    const bridge = typeof window !== 'undefined' ? window.cumora?.update : undefined
+    if (!bridge) return
+    void bridge.getAppInfo().then((info) => {
+      setVersion(info.version)
+      setSupported(info.autoUpdateSupported)
+    }).catch(() => { /* swallow — section just hides */ })
+  }, [])
+
+  if (!version) return null
+
+  return (
+    <Section title={t('me.sectionAbout')}>
+      <div className="bg-cloud rounded-[14px] p-5 flex items-center justify-between gap-4"
+        style={{ border: '1px solid var(--ink-100)' }}>
+        <div className="min-w-0">
+          <div className="font-display text-[14px] text-ink-800">{t('me.versionLine', { version })}</div>
+          <div className="font-display italic text-[12px] text-ink-400 mt-0.5">
+            {supported ? t('me.autoUpdateDaily') : t('me.autoUpdateUnsupported')}
+          </div>
+        </div>
+        <button
+          type="button"
+          onClick={() => window.dispatchEvent(new CustomEvent('cumora:open-updater'))}
+          className="shrink-0 h-9 px-4 rounded-[8px] text-[13px] font-display transition-colors text-white"
+          style={{ background: 'var(--skype)' }}
+        >
+          {t('me.checkUpdates')}
+        </button>
+      </div>
+    </Section>
+  )
+}
+
+function TrustTab() {
+  const t = useT()
+  const byId = useParticipants((s) => s.byId)
+  const autonomy = usePrefs((s) => s.autonomy)
+  const setAutonomy = usePrefs((s) => s.setAutonomy)
+  const agents = Object.values(byId).filter((p) => p.kind === 'agent')
+
+  return (
+    <div className="space-y-6">
+      <Section title={t('me.sectionPerAgent')}>
+        <div className="text-[13px] text-ink-500 leading-[1.55] mb-4 max-w-2xl font-display italic">
+          {t('me.perAgentIntro')}
+        </div>
+        <div className="space-y-2">
+          {agents.map((a) => {
+            const trust = autonomy[a.id]?.threshold ?? 0.6
+            return (
+              <div key={a.id} className="bg-cloud rounded-[12px] p-4 grid grid-cols-[184px_minmax(0,1fr)] items-center gap-5"
+                style={{ border: '1px solid var(--ink-100)' }}>
+                <div className="flex items-center gap-4 min-w-0">
+                  <Avatar p={a} size={36} showStatus={false} />
+                  <div className="min-w-0">
+                    <div className="font-bold text-[13.5px] text-ink-900 truncate">{a.name}</div>
+                    <div className="font-display italic text-[11.5px] text-ink-500 truncate">{a.role}</div>
+                  </div>
+                </div>
+                <div className="min-w-0">
+                  <div className="text-[11px] text-ink-500 mb-1.5 flex justify-between">
+                    <span>{t('me.autonomyThreshold')}</span>
+                    <span className="font-mono text-[11px] font-semibold text-ink-700">{trust.toFixed(2)}</span>
+                  </div>
+                  <input type="range" min={0} max={1} step={0.01} value={trust}
+                    onChange={(e) => setAutonomy(a.id, parseFloat(e.target.value))}
+                    className="w-full accent-whisper" />
+                </div>
+              </div>
+            )
+          })}
+        </div>
+      </Section>
+
+      <Section title={t('me.sectionTrackRecords')}>
+        <div className="grid grid-cols-3 gap-3">
+          {agents.slice(0, 3).map((a) => {
+            const ar = autonomy[a.id]
+            return (
+              <div key={a.id} className="bg-cloud rounded-[12px] p-4"
+                style={{ border: '1px solid var(--ink-100)' }}>
+                <div className="flex items-center gap-2.5 mb-3">
+                  <Avatar p={a} size={28} showStatus={false} />
+                  <div className="font-bold text-[13px] text-ink-900">{a.name}</div>
+                </div>
+                <div className="grid grid-cols-3 gap-1.5 text-center">
+                  <Stat n={ar?.pulled ?? 0} l="me.statPulled" tone="good" />
+                  <Stat n={ar?.led ?? 0} l="me.statLed" tone="good" />
+                  <Stat n={ar?.dissolved ?? 0} l="me.statNoise" tone="warn" />
+                </div>
+              </div>
+            )
+          })}
+        </div>
+      </Section>
+    </div>
+  )
+}
+
+function Stat({ n, l, tone }: { n: number; l: MessageKey; tone: 'good' | 'warn' }) {
+  const t = useT()
+  return (
+    <div>
+      <div className="font-display text-[20px] font-medium" style={{ color: tone === 'good' ? 'var(--avail)' : 'var(--coral-deep)' }}>{n}</div>
+      <div className="text-[9px] font-bold text-ink-300 uppercase tracking-wider">{t(l)}</div>
+    </div>
+  )
+}
+
+function ProjectsTab() {
+  const t = useT()
+  const [projects, setProjects] = useState<ApiProject[]>([])
+  const [showArchived, setShowArchived] = useState(false)
+  const [creating, setCreating] = useState(false)
+  const [name, setName] = useState('')
+  const [description, setDescription] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [err, setErr] = useState<string | null>(null)
+
+  const refresh = () => {
+    void api.listProjects().then(setProjects).catch(() => { /* ignore */ })
+  }
+  useEffect(refresh, [])
+
+  const create = async () => {
+    const trimmed = name.trim()
+    if (!trimmed) return
+    setBusy(true); setErr(null)
+    try {
+      await api.createProject({ name: trimmed, description: description.trim() })
+      setName(''); setDescription(''); setCreating(false); refresh()
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const archive = async (id: string, archive: boolean) => {
+    try { await api.archiveProject(id, archive); refresh() }
+    catch (e) { console.warn('[projects] archive failed', e) }
+  }
+
+  const visible = showArchived ? projects : projects.filter((p) => p.status === 'active')
+  const archivedCount = projects.filter((p) => p.status === 'archived').length
+
+  return (
+    <div className="space-y-6">
+      <Section title={t('me.sectionProjects')}>
+        <div className="text-[13px] text-ink-500 leading-[1.55] mb-4 max-w-2xl font-display italic">
+          {t('me.projectsIntro')}
+        </div>
+
+        <div className="space-y-2">
+          {visible.length === 0 && !creating && (
+            <div className="bg-cloud rounded-[12px] p-6 text-center text-[13px] text-ink-500 italic font-display"
+              style={{ border: '1px dashed var(--ink-100)' }}>
+              {t('me.noProjects')}
+            </div>
+          )}
+          {visible.map((p) => {
+            const count = p.conversationCount
+            return (
+              <div key={p.id} className="bg-cloud rounded-[12px] p-4 flex items-center gap-4"
+                style={{ border: '1px solid var(--ink-100)', opacity: p.status === 'archived' ? 0.55 : 1 }}>
+                <div className="w-3 h-10 rounded-full shrink-0" style={{ background: p.color ?? 'var(--ink-200)' }} />
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-center gap-2">
+                    <div className="font-semibold text-[14px] text-ink-900 truncate">{p.name}</div>
+                    {p.status === 'archived' && <span className="text-[10px] text-ink-300 uppercase tracking-wider">{t('me.archived')}</span>}
+                  </div>
+                  <div className="font-display italic text-[12px] text-ink-500 truncate">
+                    {p.description || t('me.noDescription')}  ·  {count === 1 ? t('me.projectConvoCount', { n: count }) : t('me.projectConvoCountPlural', { n: count })}
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => archive(p.id, p.status !== 'archived')}
+                  className="px-3 py-1.5 rounded-[8px] text-[11.5px] font-semibold text-ink-700 bg-paper hover:bg-sky2-50 transition"
+                  style={{ border: '1px solid var(--ink-100)' }}
+                >{p.status === 'archived' ? t('me.restore') : t('me.archive')}</button>
+              </div>
+            )
+          })}
+        </div>
+
+        {creating ? (
+          <div className="mt-4 bg-cloud rounded-[12px] p-4 space-y-2"
+            style={{ border: '1.5px solid var(--sky2-300)' }}>
+            <input
+              autoFocus
+              type="text"
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              placeholder={t('me.projectNamePh')}
+              className="w-full px-3 py-2 text-[13px] rounded outline-none"
+              style={{ border: '1px solid var(--ink-100)', background: 'var(--paper)' }}
+            />
+            <input
+              type="text"
+              value={description}
+              onChange={(e) => setDescription(e.target.value)}
+              placeholder={t('me.projectDescPh')}
+              className="w-full px-3 py-2 text-[12.5px] rounded outline-none"
+              style={{ border: '1px solid var(--ink-100)', background: 'var(--paper)' }}
+            />
+            {err && <div className="text-[11.5px] text-coral-deep">{err}</div>}
+            <div className="flex gap-2">
+              <button
+                type="button"
+                onClick={create}
+                disabled={!name.trim() || busy}
+                className="px-4 py-1.5 rounded-[8px] text-[12px] font-semibold text-white disabled:opacity-50"
+                style={{ background: 'var(--skype)' }}
+              >{busy ? t('me.createProjectBusy') : t('me.createProject')}</button>
+              <button
+                type="button"
+                onClick={() => { setCreating(false); setName(''); setDescription(''); setErr(null) }}
+                className="px-3 py-1.5 rounded-[8px] text-[12px] text-ink-500 hover:bg-cloud"
+              >{t('common.cancel')}</button>
+            </div>
+          </div>
+        ) : (
+          <div className="mt-4 flex items-center gap-3">
+            <button
+              type="button"
+              onClick={() => setCreating(true)}
+              className="px-4 py-2 rounded-[10px] text-[12.5px] font-semibold text-skype-deep bg-cloud hover:bg-sky2-50 transition"
+              style={{ border: '1px dashed var(--sky2-300)' }}
+            >{t('me.newProject')}</button>
+            {archivedCount > 0 && (
+              <button
+                type="button"
+                onClick={() => setShowArchived((v) => !v)}
+                className="text-[11.5px] text-ink-500 hover:text-skype-deep transition italic font-display"
+              >
+                {showArchived ? t('me.hideArchived') : t('me.showArchivedCount', { n: archivedCount })}
+              </button>
+            )}
+          </div>
+        )}
+      </Section>
+    </div>
+  )
+}
+
+function PreferencesTab() {
+  const t = useT()
+  const prefs = usePrefs((s) => s.prefs)
+  const setPref = usePrefs((s) => s.setPref)
+  const devtoolsEnabled = useDevtools((s) => s.enabled)
+  const devtoolsCanEnable = useDevtools((s) => s.canEnable)
+  const devtoolsLocal = useDevtools((s) => s.localDev)
+  const setDevMode = useDevtools((s) => s.setDevMode)
+  const loadDevtools = useDevtools((s) => s.load)
+  const get = (k: string, fallback: boolean) => (prefs[k] === undefined ? fallback : Boolean(prefs[k]))
+
+  useEffect(() => {
+    void loadDevtools()
+  }, [loadDevtools])
+
+  return (
+    <div className="space-y-6">
+      {PREF_GROUPS.map((g) => (
+        <Section key={g.title} title={`↳ ${t(g.title)}`}>
+          <div className="bg-cloud rounded-[14px] divide-y divide-ink-100"
+            style={{ border: '1px solid var(--ink-100)' }}>
+            {g.items.map((it, i) => {
+              const on = get(it.key, it.default)
+              return (
+                <div key={i} className="flex items-center gap-4 p-4 cursor-pointer" onClick={() => setPref(it.key, !on)}>
+                  <div className="flex-1 min-w-0">
+                    <div className="font-semibold text-[13px] text-ink-900">{t(it.lbl)}</div>
+                    <div className="font-display italic font-normal text-[11.5px] text-ink-500 mt-0.5">{t(it.sub)}</div>
+                  </div>
+                  <span className={cn('w-9 h-5 rounded-full relative shrink-0 transition-colors', on ? 'bg-skype' : 'bg-ink-200')}>
+                    <span className={cn('absolute w-4 h-4 bg-white rounded-full top-0.5 transition-all', on ? 'left-[18px]' : 'left-0.5')}
+                      style={{ boxShadow: '0 1px 3px rgba(0,0,0,0.2)' }} />
+                  </span>
+                </div>
+              )
+            })}
+          </div>
+        </Section>
+      ))}
+      <LanguageSection />
+      <AppearanceSection />
+      <SkypeSoundSection />
+      {devtoolsCanEnable && (
+        <Section title={`↳ ${t('me.prefs.developer')}`}>
+          <Checkbox
+            checked={devtoolsEnabled}
+            disabled={devtoolsLocal}
+            onCheckedChange={(next) => { void setDevMode(next) }}
+            label={t('me.prefs.developerMode')}
+            description={devtoolsLocal
+              ? t('me.prefs.developerModeLocal')
+              : t('me.prefs.developerModeSub')}
+          />
+        </Section>
+      )}
+    </div>
+  )
+}
+
+function LanguageSection() {
+  const t = useT()
+  return (
+    <Section title={`↳ ${t('me.prefs.languageSection')}`}>
+      <div className="bg-cloud rounded-[14px] p-4 flex items-center gap-4"
+        style={{ border: '1px solid var(--ink-100)' }}>
+        <div className="flex-1 min-w-0">
+          <div className="font-semibold text-[13px] text-ink-900">{t('common.language')}</div>
+          <div className="font-display italic font-normal text-[11.5px] text-ink-500 mt-0.5">
+            {t('common.languageSub')}
+          </div>
+        </div>
+        <LanguagePicker className="w-[180px] shrink-0" />
+      </div>
+    </Section>
+  )
+}
+
+function AppearanceSection() {
+  const t = useT()
+  return (
+    <Section title={`↳ ${t('me.prefs.appearanceSection')}`}>
+      <div className="bg-cloud rounded-[14px] p-4 flex items-center gap-4"
+        style={{ border: '1px solid var(--ink-100)' }}>
+        <div className="flex-1 min-w-0">
+          <div className="font-semibold text-[13px] text-ink-900">{t('common.appearance')}</div>
+          <div className="font-display italic font-normal text-[11.5px] text-ink-500 mt-0.5">
+            {t('common.appearanceSub')}
+          </div>
+        </div>
+        <AppearancePicker className="w-[180px] shrink-0" />
+      </div>
+      <div className="bg-cloud rounded-[14px] p-4 flex items-center gap-4 mt-2"
+        style={{ border: '1px solid var(--ink-100)' }}>
+        <div className="flex-1 min-w-0">
+          <div className="font-semibold text-[13px] text-ink-900">{t('common.chatLayout')}</div>
+          <div className="font-display italic font-normal text-[11.5px] text-ink-500 mt-0.5">
+            {t('common.chatLayoutSub')}
+          </div>
+        </div>
+        <ChatLayoutPicker className="w-[180px] shrink-0" />
+      </div>
+    </Section>
+  )
+}
+
+function SkypeSoundSection() {
+  // Local-only toggle — see stores/sound.ts for why this isn't synced
+  // through the server preferences store. Default is muted; users opt
+  // in if they want the classic (clap) / (drum) chimes.
+  const t = useT()
+  const muted = useSoundStore((s) => s.muted)
+  const setMuted = useSoundStore((s) => s.setMuted)
+  const on = !muted
+  return (
+    <Section title={`↳ ${t('me.prefs.skypeSection')}`}>
+      <div className="bg-cloud rounded-[14px]"
+        style={{ border: '1px solid var(--ink-100)' }}>
+        <div className="flex items-center gap-4 p-4 cursor-pointer" onClick={() => setMuted(on)}>
+          <div className="flex-1 min-w-0">
+            <div className="font-semibold text-[13px] text-ink-900">{t('me.prefs.skypeSounds')}</div>
+            <div className="font-display italic font-normal text-[11.5px] text-ink-500 mt-0.5">
+              {t('me.prefs.skypeSoundsSub')}
+            </div>
+          </div>
+          <span className={cn('w-9 h-5 rounded-full relative shrink-0 transition-colors', on ? 'bg-skype' : 'bg-ink-200')}>
+            <span className={cn('absolute w-4 h-4 bg-white rounded-full top-0.5 transition-all', on ? 'left-[18px]' : 'left-0.5')}
+              style={{ boxShadow: '0 1px 3px rgba(0,0,0,0.2)' }} />
+          </span>
+        </div>
+      </div>
+    </Section>
+  )
+}
+
+const KIND_ICON: Record<string, string> = { cloud: '☁', local: '💻', vps: '🖥' }
+const STATUS_COLOR: Record<string, string> = { online: '#3BB273', busy: '#E6A23C', offline: 'var(--ink-300)' }
+
+type AgentRow = {
+  id: string
+  bin: string
+  path: string | null
+  version?: string | null
+  latest?: string | null
+  outdated?: boolean
+  updateCommand?: string | null
+  blockedReason?: string | null
+  /** Models this computer's own CLI login can reach. Absent on daemons that
+   *  predate catalog reporting, which is why the picker keeps custom entry. */
+  modelCatalog?: EngineModelCatalog
+}
+
+const CLI_ORDER = [
+  'claude', 'cursor', 'codex', 'grok', 'opencode',
+  'pi', 'gemini', 'qwen', 'zcode', 'maka', 'omp', 'hermes',
+]
+
+const COMPUTER_STATUS_KEY: Record<string, MessageKey> = {
+  online: 'me.computerStatus.online',
+  busy: 'me.computerStatus.busy',
+  offline: 'me.computerStatus.offline',
+}
+
+/** The engines installed on `computer`, as that computer's own daemon reported
+ *  them — paths and versions included.
+ *
+ *  This deliberately does NOT consult the machine the app happens to be running
+ *  on. The card describes a remote host; the only process that can see that
+ *  host's PATH is the daemon on it. An earlier version overlaid a local PATH
+ *  scan whenever it guessed the card was "this machine", which painted the
+ *  desktop's own engine versions onto whichever computer it guessed wrong about. */
+function pairedRows(computer: Computer): AgentRow[] {
+  const rows: AgentRow[] = computer.detectedEngines && computer.detectedEngines.length > 0
+    ? computer.detectedEngines
+    : (computer.availableEngines ?? []).map((id) => ({
+      id, bin: ENGINE_BIN[id] ?? id, path: null as string | null,
+    }))
+  return [...rows].sort((a, b) => {
+    const ia = CLI_ORDER.indexOf(a.id)
+    const ib = CLI_ORDER.indexOf(b.id)
+    return (ia === -1 ? 99 : ia) - (ib === -1 ? 99 : ib)
+  })
+}
+
+function asRunnableEngine(id: string): EngineId | null {
+  if (RUNNABLE_ENGINE_IDS.has(id) && id !== 'managed') return id as EngineId
+  return null
+}
+
+function ComputersTab() {
+  const t = useT()
+  const companyId = useAuth((s) => s.activeCompanyId)
+  const code = usePairingCodes((s) => s.companyId === companyId ? s.code : null)
+  // Onboarding and workspace settings share this code; only this tab's Add
+  // action should reveal a command here.
+  const [showPairCommand, setShowPairCommand] = useState(false)
+  const byId = useComputers((s) => s.byId)
+  const loaded = useComputers((s) => s.loaded)
+  const participants = useParticipants((s) => s.byId)
+  const [busy, setBusy] = useState(false)
+  const [err, setErr] = useState<string | null>(null)
+  const [copied, setCopied] = useState(false)
+  // Engine for a NEWLY added computer's starter/assigned agents. Claude is the
+  // default (no flag → daemon auto-detects); every other pick is named
+  // explicitly, or the daemon auto-detects and engines[0] silently wins.
+  const [engine, setEngine] = useState<RunnableEngineId>('claude')
+  // Default on: install the always-on service (auto-start/restart/update).
+  const [asService, setAsService] = useState(true)
+  // Per-computer re-pair (reconnect) command, keyed by computer id.
+  // Which computers have their engine list open. Collapsed by default: a
+  // paired machine can carry seven CLIs, each with a path, two versions and an
+  // update command, which buried the machines themselves under a wall of
+  // detail. The header keeps the summary ("5 engines detected"), so the count
+  // is legible without opening anything.
+  const [enginesOpen, setEnginesOpen] = useState<ReadonlySet<string>>(new Set())
+  const toggleEngines = useCallback((id: string) => {
+    setEnginesOpen((prev) => {
+      const next = new Set(prev)
+      if (!next.delete(id)) next.add(id)
+      return next
+    })
+  }, [])
+  const [repairFor, setRepairFor] = useState<string | null>(null)
+  const [repairCode, setRepairCode] = useState<string | null>(null)
+  const [repairCopied, setRepairCopied] = useState(false)
+  const [busyId, setBusyId] = useState<string | null>(null)
+  const [modeBusyId, setModeBusyId] = useState<string | null>(null)
+  const [modeNotice, setModeNotice] = useState<string | null>(null)
+  const hasPendingMode = Object.values(byId).some((c) => c.kind !== 'cloud'
+    && Boolean(c.unsandboxedEnabled) !== Boolean(c.unsandboxedActive))
+  const [copiedCli, setCopiedCli] = useState<string | null>(null)
+  // `computerId:engine` whose update the daemon is running right now.
+  const [updatingCli, setUpdatingCli] = useState<string | null>(null)
+  // Engine model defaults editing: which computer+engine is being edited
+  const [editingModel, setEditingModel] = useState<{ computerId: string; engineId: string } | null>(null)
+  const [modelInput, setModelInput] = useState('')
+  const [fastModelInput, setFastModelInput] = useState('')
+  const [savingModel, setSavingModel] = useState(false)
+
+  const saveEngineDefaults = async (computerId: string, engineId: string) => {
+    const savedEditor = editingModel
+    setSavingModel(true)
+    setErr(null)
+    try {
+      const defaults = {
+        [engineId]: {
+          model: modelInput.trim() || null,
+          fastModel: fastModelInput.trim() || null,
+        },
+      }
+      await api.updateEngineDefaults(computerId, defaults)
+      await useComputers.getState().refresh()
+      // A late response must not close a different editing session.
+      setEditingModel((current) => current === savedEditor ? null : current)
+    } catch (e) {
+      console.warn('[engine-defaults] save failed', e)
+      setErr(e instanceof Error ? e.message : String(e))
+    } finally {
+      setSavingModel(false)
+    }
+  }
+
+  const startEditModel = (computerId: string, engineId: string, currentModel?: string | null, currentFastModel?: string | null) => {
+    setEditingModel({ computerId, engineId })
+    setModelInput(currentModel ?? '')
+    setFastModelInput(currentFastModel ?? '')
+  }
+
+  useEffect(() => {
+    void useComputers.getState().refresh()
+  }, [])
+  useEffect(() => {
+    // Resume confirmation after a reload; a saved preference is not an active mode.
+    if (!hasPendingMode || modeBusyId !== null) return
+    const interval = window.setInterval(() => { void useComputers.getState().refresh() }, 1000)
+    const timeout = window.setTimeout(() => window.clearInterval(interval), 45_000)
+    return () => { window.clearInterval(interval); window.clearTimeout(timeout) }
+  }, [hasPendingMode, modeBusyId])
+  useEffect(() => { if (!repairCopied) return; const id = window.setTimeout(() => setRepairCopied(false), 1600); return () => window.clearTimeout(id) }, [repairCopied])
+  useEffect(() => { if (!copiedCli) return; const id = window.setTimeout(() => setCopiedCli(null), 1600); return () => window.clearTimeout(id) }, [copiedCli])
+  useEffect(() => { setCopied(false) }, [code, companyId])
+  useEffect(() => { setShowPairCommand(false) }, [companyId])
+
+  async function toggleRepair(id: string) {
+    if (repairFor === id) { setRepairFor(null); setRepairCode(null); return }
+    await openRepair(id)
+  }
+
+  async function openRepair(id: string) {
+    if (repairFor === id) return
+    setRepairFor(id); setRepairCode(null)
+    try { setRepairCode((await api.repairComputer(id)).code) }
+    catch (e) { alert(e instanceof Error ? e.message : String(e)); setRepairFor(null) }
+  }
+  useEffect(() => { if (!copied) return; const id = window.setTimeout(() => setCopied(false), 1600); return () => window.clearTimeout(id) }, [copied])
+
+  async function copyCommand() {
+    setErr(null)
+    setCopied(false)
+    try {
+      await copyText(pairCommand)
+      setCopied(true)
+    } catch {
+      setErr(t('me.copyFailed'))
+    }
+  }
+
+  async function copyRepairCommand(command: string) {
+    setErr(null)
+    setRepairCopied(false)
+    try {
+      await copyText(command)
+      setRepairCopied(true)
+    } catch {
+      setErr(t('me.copyFailed'))
+    }
+  }
+
+  const origin = getPairingServerOrigin()
+  const serverFlag = origin ? ` --server ${origin}` : ''
+  const engineFlag = engine === 'claude' ? '' : ` --engine ${engine}`
+  const pairCommand = code ? `npx cumora@latest agent computer --pair ${code}${serverFlag}${engineFlag}${asService ? ' --install-service' : ''}` : ''
+  const list = Object.values(byId).sort((a, b) =>
+    (a.kind === 'cloud' ? 0 : 1) - (b.kind === 'cloud' ? 0 : 1) || a.name.localeCompare(b.name))
+
+  function agentCount(computerId: string, isCloud: boolean): number {
+    return Object.values(participants).filter((p) =>
+      p.kind === 'agent' && !p.departedAt &&
+      (p.computerId === computerId || (isCloud && !p.computerId))).length
+  }
+
+  // Clicking "Add a computer" reads the current pairing token and shows the command.
+  // The computer itself is created server-side only when the daemon pairs and
+  // reports the machine's real hostname — so no placeholder row, and it shows
+  // up here (named after the machine) once paired, via the WS status event.
+  async function addComputer() {
+    const targetCompanyId = useAuth.getState().activeCompanyId
+    if (!targetCompanyId) return
+    setErr(null); setBusy(true); setCopied(false); setShowPairCommand(false)
+    try {
+      // Another screen may have left a code in the shared store. Always read
+      // the active code before revealing this tab's command.
+      const version = usePairingCodes.getState().beginRequest(targetCompanyId, true)
+      const res = await api.requestPairingCode()
+      usePairingCodes.getState().setCodeIfCurrent(targetCompanyId, version, res.code)
+      const state = usePairingCodes.getState()
+      if (state.companyId === targetCompanyId && state.requestVersion === version) {
+        setShowPairCommand(true)
+      }
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e))
+    } finally { setBusy(false) }
+  }
+
+  async function remove(id: string, label: string) {
+    if (!confirm(t('me.removeConfirm', { label }))) return
+    try {
+      await api.deleteComputer(id)
+      await useComputers.getState().refresh()
+    } catch (e) { alert(e instanceof Error ? e.message : String(e)) }
+  }
+
+  async function refreshEngines(id: string) {
+    setErr(null)
+    setBusyId(id)
+    try {
+      const before = useComputers.getState().byId[id]?.enginesDetectedAt ?? null
+      await api.requestComputerEngineDetect(id)
+
+      // A paired daemon receives the request on its next heartbeat and then
+      // reports a fresh snapshot. Keep the button busy until that report lands,
+      // instead of presenting a cached GET as a completed engine refresh.
+      const deadline = Date.now() + 50_000
+      while (Date.now() < deadline) {
+        await new Promise((resolve) => window.setTimeout(resolve, 750))
+        await useComputers.getState().refresh()
+        const after = useComputers.getState().byId[id]?.enginesDetectedAt ?? null
+        if (after && after !== before) return
+      }
+      throw new Error(t('me.agentsRefreshTimedOut'))
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e))
+    } finally {
+      setBusyId(null)
+    }
+  }
+
+  async function toggleUnsandboxed(computer: Computer) {
+    const enabled = !computer.unsandboxedEnabled
+    const confirmation = enabled
+      ? t('me.unsandboxedConfirmOn', { name: computer.name })
+      : t('me.unsandboxedConfirmOff', { name: computer.name })
+    if (!confirm(confirmation)) return
+    setModeBusyId(computer.id)
+    setModeNotice(null)
+    setErr(null)
+    try {
+      const result = await api.setComputerUnsandboxedMode(computer.id, enabled)
+      await useComputers.getState().refresh()
+      if (result.active === enabled) {
+        // The daemon reports the new mode before its post-restart engine scan;
+        // request that snapshot so the card cannot claim success with stale rows.
+        await refreshEngines(computer.id)
+        setModeNotice(t(enabled ? 'me.unsandboxedActive' : 'me.compatibilityDisabled'))
+      } else if (!result.online) {
+        setModeNotice(t('me.unsandboxedOffline'))
+      } else if (result.supervised === true) {
+        setModeNotice(t('me.unsandboxedAutoRestart'))
+        const deadline = Date.now() + 45_000
+        while (Date.now() < deadline) {
+          await new Promise((resolve) => window.setTimeout(resolve, 1000))
+          await useComputers.getState().refresh()
+          if (useComputers.getState().byId[computer.id]?.unsandboxedActive === enabled) {
+            await refreshEngines(computer.id)
+            setModeNotice(t(enabled ? 'me.unsandboxedActive' : 'me.compatibilityDisabled'))
+            return
+          }
+        }
+        setModeNotice(t('me.unsandboxedRestartFailed'))
+      } else if (result.supervised === false) {
+        setModeNotice(t('me.unsandboxedManualRestart', { command: 'npx cumora@latest agent computer' }))
+      } else {
+        setModeNotice(t('me.unsandboxedRestartFailed'))
+      }
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e))
+    } finally {
+      setModeBusyId(null)
+    }
+  }
+
+  /** Only this request's result ends the wait; ordinary scans are unrelated. */
+  async function updateEngine(computerId: string, engineId: string) {
+    const key = `${computerId}:${engineId}`
+    setErr(null)
+    setUpdatingCli(key)
+    try {
+      const { updateId } = await api.updateComputerEngine(computerId, engineId)
+      const deadline = Date.now() + ENGINE_UPDATE_TTL_SECONDS * 1000
+      while (Date.now() < deadline) {
+        const update = await api.getComputerEngineUpdate(computerId, updateId)
+        if (update.status === 'failed') throw new Error(update.error || t('me.agentsUpdateFailed'))
+        if (update.status === 'succeeded') {
+          await useComputers.getState().refresh()
+          return
+        }
+        await new Promise((resolve) => window.setTimeout(resolve, 2000))
+        await useComputers.getState().refresh()
+      }
+      setErr(t('me.agentsUpdateWaiting', { name: useComputers.getState().byId[computerId]?.name ?? '' }))
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e))
+    } finally {
+      setUpdatingCli(null)
+    }
+  }
+
+  return (
+    <div className="space-y-6">
+      <Section title={t('me.sectionComputers')}>
+        {/* biome-ignore lint/security/noDangerouslySetInnerHtml: static copy from the locale bundle, not user input */}
+        <p className="text-[13px] text-ink-500 mb-4 max-w-[640px]" dangerouslySetInnerHTML={{ __html: t('me.computersIntro') }} />
+
+        {!loaded && <div className="text-[13px] text-ink-400">{t('common.loading')}</div>}
+
+        {err && <div className="mb-3 text-[12px] text-coral-deep bg-coral-soft rounded-[8px] p-2">{err}</div>}
+        {modeNotice && <div className="mb-3 text-[12px] text-skype-deep bg-sky2-50 rounded-[8px] p-2">{modeNotice}</div>}
+
+        <div className="grid gap-3">
+          {list.map((c) => {
+            const n = agentCount(c.id, c.kind === 'cloud')
+            const repairable = c.kind !== 'cloud'
+            const expanded = repairFor === c.id
+            const enginesShown = enginesOpen.has(c.id)
+            const repairCmd = repairCode ? `npx cumora@latest agent computer --pair ${repairCode}${serverFlag}` : ''
+            const rows = repairable ? pairedRows(c) : []
+            const detecting = busyId === c.id
+            const modePending = Boolean(c.unsandboxedEnabled) !== Boolean(c.unsandboxedActive)
+            const modeApplying = modeBusyId === c.id || modePending
+            // Extracted so the header can be wrapped in either a plain
+            // container or a real toggle control without duplicating it.
+            const headerBody = (
+              <>
+                    <div className="text-[22px] w-8 text-center">{KIND_ICON[c.kind] ?? '🖥'}</div>
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-center gap-2">
+                        <span className="font-display font-medium text-[16px] text-ink-900">{c.name}</span>
+                        <span className="inline-flex items-center gap-1.5 text-[11px] text-ink-500">
+                          <span className="w-2 h-2 rounded-full" style={{ background: STATUS_COLOR[c.status] ?? 'var(--ink-300)' }} />
+                          {t(COMPUTER_STATUS_KEY[c.status] ?? 'me.computerStatus.offline')}
+                        </span>
+                        {repairable && (c.unsandboxedActive || modeApplying) && (
+                          <span className={cn('text-[10px] font-semibold px-2 py-0.5 rounded-full',
+                            modeApplying ? 'bg-sky2-50 text-skype-deep' : 'bg-coral-soft text-coral-deep')}>
+                            {t(modeApplying ? 'me.unsandboxedPending' : 'me.unsandboxedActive')}
+                          </span>
+                        )}
+                        {c.daemonOutdated && (
+                          <span className="inline-flex items-center gap-1 text-[10.5px] font-semibold px-2 py-0.5 rounded-full"
+                            style={{ background: 'rgba(244,183,64,0.18)', color: 'var(--gold-deep)' }}
+                            title={c.latestDaemonVersion ? t('me.updateToVersion', { version: c.latestDaemonVersion }) : t('me.updateAvailableTitle')}>
+                            ↑ {t('me.updateAvailableShort')}{c.daemonVersion ? ` · ${t('me.daemonVersion', { version: c.daemonVersion })}` : ''}
+                          </span>
+                        )}
+                      </div>
+                      <div className="flex items-center text-[12px] text-ink-500 mt-0.5">
+                        {repairable
+                          ? (
+                            <>
+                              <span>
+                                {rows.length > 0
+                                  ? (rows.length === 1 ? t('me.agentsCliDetectedOne', { n: rows.length }) : t('me.agentsCliDetectedOther', { n: rows.length }))
+                                  : (n === 1 ? t('me.agentsCountOne', { n }) : t('me.agentsCountOther', { n }))}
+                              </span>
+                              {c.daemonVersion && (
+                                <>
+                                  <span className="shrink-0 text-ink-300" style={{ marginLeft: 10, marginRight: 10 }}>·</span>
+                                  <span>{t('me.daemonVersionLocal', { version: c.daemonVersion })}</span>
+                                </>
+                              )}
+                            </>
+                          )
+                          : (
+                            <>
+                              {c.availableEngines.map((e) => ENGINE_LABEL[e] ?? e).join(', ') || '—'}
+                              {' · '}{n === 1 ? t('me.agentsCountOne', { n }) : t('me.agentsCountOther', { n })}
+                            </>
+                          )}
+                      </div>
+                    </div>
+                    {repairable && (
+                      <>
+                        <button
+                          type="button"
+                          role="switch"
+                          aria-checked={Boolean(c.unsandboxedEnabled)}
+                          aria-busy={modeApplying}
+                          aria-label={t('me.compatibilityMode')}
+                          disabled={modeBusyId === c.id}
+                          onClick={(e) => { e.stopPropagation(); void toggleUnsandboxed(c) }}
+                          className="group inline-flex items-center gap-2 rounded-full px-2 py-1 text-[11px] font-semibold text-ink-600 transition-transform active:scale-[.97] hover:bg-sky2-50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-skype disabled:opacity-50"
+                          title={t('me.unsandboxedHint')}
+                        >
+                          <span
+                            aria-hidden="true"
+                            className={cn('relative block h-5 w-9 shrink-0 overflow-hidden rounded-full transition-[background,box-shadow] duration-300',
+                              c.unsandboxedEnabled ? 'bg-skype' : 'bg-ink-200')}
+                            style={{
+                              boxShadow: c.unsandboxedEnabled
+                                ? 'inset 0 1px 2px rgba(255,255,255,.55), 0 2px 9px rgba(0,120,200,.25)'
+                                : 'inset 0 1px 2px rgba(25,45,60,.12)',
+                            }}
+                          >
+                            <span className="absolute inset-x-1 top-px h-[7px] rounded-full bg-gradient-to-r from-white/20 via-white/70 to-white/10 opacity-80" />
+                            <span
+                              className="absolute top-0.5 h-4 w-4 rounded-full transition-[left,transform] duration-300 ease-out group-active:scale-x-110"
+                              style={{
+                                left: c.unsandboxedEnabled ? 18 : 2,
+                                background: 'linear-gradient(145deg, #fff 8%, #f3fbff 68%, #cfeeff)',
+                                boxShadow: '0 1px 4px rgba(31,65,87,.28), inset 0 1px 1px rgba(255,255,255,.95)',
+                              }}
+                            >
+                              <span className="absolute left-[3px] top-[2px] h-1 w-1 rounded-full bg-white/90 blur-[.5px]" />
+                            </span>
+                          </span>
+                          <span>{t('me.compatibilityMode')}</span>
+                          <span className={c.unsandboxedEnabled || modeApplying ? 'text-skype-deep' : 'text-ink-400'}>
+                            {modePending
+                              ? t(c.unsandboxedEnabled ? 'me.unsandboxedPendingOn' : 'me.unsandboxedPendingOff')
+                              : modeApplying ? t('me.unsandboxedPending')
+                              : t(c.unsandboxedEnabled ? 'me.compatibilityEnabled' : 'me.compatibilityDisabled')}
+                          </span>
+                        </button>
+                        <button type="button" disabled={detecting} onClick={(e) => { e.stopPropagation(); void refreshEngines(c.id) }}
+                          className="text-[12px] font-semibold text-skype-deep disabled:opacity-45 px-2 py-1">
+                          {detecting ? t('me.agentsRefreshing') : t('me.agentsRefresh')}
+                        </button>
+                        {/* Was a bare span riding the header's onClick. The header
+                            now opens the engine list, so reconnect needs its own
+                            handler — and must not also toggle the list. */}
+                        <button type="button" onClick={(e) => { e.stopPropagation(); void toggleRepair(c.id) }}
+                          className="text-[12px] font-semibold text-skype-deep px-2 py-1">
+                          {expanded ? t('me.hideAction') : t('me.reconnect')}
+                        </button>
+                        <button type="button" onClick={(e) => { e.stopPropagation(); void remove(c.id, c.name) }}
+                          className="text-[12px] font-semibold text-coral-deep hover:underline px-2 py-1">
+                          {t('me.remove')}
+                        </button>
+                        <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor"
+                          strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"
+                          className="text-ink-300 shrink-0 transition-transform"
+                          style={{ transform: enginesShown ? 'rotate(180deg)' : 'none' }}>
+                          <path d="M6 9l6 6 6-6" />
+                        </svg>
+                      </>
+                    )}
+              </>
+            )
+            // A card whose engine list can be opened IS a disclosure control,
+            // so it carries the role, a focus stop, the expanded state and a
+            // keyboard path. Written as two branches rather than one element
+            // with a conditional role: a role the linter cannot resolve reads
+            // as a plain div, which is how the aria-expanded here came to be
+            // dropped in #129. Cloud cards toggle nothing and stay inert.
+            const header = repairable ? (
+              <div
+                className="p-4 flex items-center gap-4 rounded-[14px] cursor-pointer hover:bg-sky2-50"
+                role="button"
+                tabIndex={0}
+                aria-expanded={enginesShown}
+                onClick={() => toggleEngines(c.id)}
+                onKeyDown={(e) => {
+                  if (e.key !== 'Enter' && e.key !== ' ') return
+                  e.preventDefault()
+                  toggleEngines(c.id)
+                }}>
+                {headerBody}
+              </div>
+            ) : (
+              <div className="p-4 flex items-center gap-4 rounded-[14px]">{headerBody}</div>
+            )
+            return (
+              <div key={c.id} className="bg-cloud rounded-[14px]" style={{ border: '1px solid var(--ink-100)' }}>
+                {header}
+                {repairable && modePending && c.daemonSupervised !== true && (
+                  <p className="px-4 pb-3 text-[12px] text-ink-500">
+                    {c.status === 'offline' ? t('me.unsandboxedOffline')
+                      : c.daemonSupervised === false
+                        ? t('me.unsandboxedManualRestart', { command: 'npx cumora@latest agent computer' })
+                        : t('me.unsandboxedRestartFailed')}
+                  </p>
+                )}
+                {repairable && enginesShown && (
+                  rows.length === 0 ? (
+                    <div className="px-4 pb-4 text-[12px] text-ink-400">{t('me.agentsNoEngines')}</div>
+                  ) : (
+                    <div className="px-4 pb-4 space-y-2">
+                      {rows.map((row) => {
+                        const engineId = asRunnableEngine(row.id)
+                        const copyKey = `${c.id}:${row.id}`
+                        return (
+                          <div key={row.id} className="rounded-[12px] px-3 py-2.5"
+                            style={{ border: '1px solid var(--ink-100)' }}>
+                            <div className="flex items-start gap-3">
+                              <div className="flex-1 min-w-0">
+                                <div className="flex items-center gap-2 min-w-0">
+                                  <div className="text-[13px] font-semibold text-ink-900 shrink-0">{engineLabel(row.id)}</div>
+                                  {row.outdated && (
+                                    <span
+                                      className="text-[12px] font-semibold px-2 py-0.5 rounded-full shrink-0 bg-gold/20 text-gold-deep"
+                                    >
+                                      {t('me.agentsCliUpdateAvailable')}
+                                    </span>
+                                  )}
+                                  {/* Two different things, deliberately not one
+                                      label: "not runnable" means Cumora has no
+                                      adapter for this CLI and the operator can
+                                      do nothing about it, while "blocked" means
+                                      it is supported but was refused here for a
+                                      reason they can act on. */}
+                                  {row.blockedReason ? (
+                                    <span className="text-[12px] font-semibold px-2 py-0.5 rounded-full shrink-0 bg-coral-soft text-coral-deep">
+                                      {t('me.agentsCliBlocked')}
+                                    </span>
+                                  ) : !engineId && (
+                                    <span className="text-[12px] text-ink-400 truncate">{t('me.agentsNotRunnable')}</span>
+                                  )}
+                                </div>
+                                {row.blockedReason && (
+                                  <div className="mt-1 text-[12px] leading-[1.55] text-coral-deep">
+                                    {t('me.agentsCliBlockedReason', { reason: row.blockedReason })}
+                                  </div>
+                                )}
+                                <div className="mt-1 flex items-center min-w-0 font-mono text-[12px] text-ink-400">
+                                  <span className="shrink-0">{row.bin}</span>
+                                  {row.path && (
+                                    <>
+                                      <span className="shrink-0 text-ink-300" style={{ marginLeft: 10, marginRight: 10 }}>·</span>
+                                      <span className="truncate">{row.path}</span>
+                                    </>
+                                  )}
+                                </div>
+                                {(row.version || row.latest) && (
+                                  <div className="mt-1 flex items-center text-[12px] text-ink-500">
+                                    <span>{row.version ? t('me.agentsCliInstalled', { version: row.version }) : t('me.agentsCliUnknown')}</span>
+                                    {row.latest && (
+                                      <>
+                                        <span className="shrink-0 text-ink-300" style={{ marginLeft: 10, marginRight: 10 }}>·</span>
+                                        <span>{t('me.agentsCliLatest', { latest: row.latest })}</span>
+                                      </>
+                                    )}
+                                    {!row.outdated && row.latest && row.version === row.latest && (
+                                      <>
+                                        <span className="shrink-0 text-ink-300" style={{ marginLeft: 10, marginRight: 10 }}>·</span>
+                                        <span>{t('me.agentsCliCurrent')}</span>
+                                      </>
+                                    )}
+                                  </div>
+                                )}
+                              </div>
+                            </div>
+                            {row.updateCommand && (
+                              <div className="mt-2">
+                                {/* The card describes another machine. The button
+                                    runs the updater there; the command stays for
+                                    anyone who would rather do it by hand. */}
+                                <div className="text-[11px] text-ink-400 mb-1">
+                                  {t('me.agentsUpdateHint', { name: c.name })}
+                                </div>
+                                <div className="flex items-center gap-2">
+                                <pre className="flex-1 min-w-0 font-mono text-[11px] truncate bg-ink-900 text-cloud rounded-[8px] px-2 py-1.5 select-all">{row.updateCommand}</pre>
+                                <button
+                                  type="button"
+                                  onClick={(e) => {
+                                    e.stopPropagation()
+                                    void navigator.clipboard?.writeText(row.updateCommand!)
+                                    setCopiedCli(copyKey)
+                                  }}
+                                  className="text-[12px] font-semibold text-skype-deep hover:underline shrink-0"
+                                >
+                                  {copiedCli === copyKey ? t('me.copied') : t('me.agentsCopyUpdate')}
+                                </button>
+                                {row.outdated && (
+                                  <button
+                                    type="button"
+                                    disabled={updatingCli !== null}
+                                    onClick={(e) => { e.stopPropagation(); void updateEngine(c.id, row.id) }}
+                                    className="shrink-0 px-3 py-1.5 rounded-[8px] text-[12px] font-semibold text-white disabled:opacity-50"
+                                    style={{ background: 'var(--skype)' }}
+                                  >
+                                    {updatingCli === copyKey ? t('me.agentsUpdating') : t('me.agentsUpdate')}
+                                  </button>
+                                )}
+                                </div>
+                              </div>
+                            )}
+                            {/* Engine model configuration */}
+                            {engineId && (
+                              <div className="mt-3 pt-3" style={{ borderTop: '1px dashed var(--ink-100)' }}>
+                                {editingModel?.computerId === c.id && editingModel?.engineId === row.id ? (
+                                  <div className="space-y-2">
+                                    {/* No `uppercase`: the engine name is a
+                                        brand ("Claude Code"), not a label. */}
+                                    <div className="text-[11px] font-semibold text-ink-600 tracking-wider">
+                                      {t('me.engineModelConfig', { engine: engineLabel(row.id) })}
+                                    </div>
+                                    {/* <fieldset disabled> carries the in-flight
+                                        disable the plain inputs had: <Combobox>
+                                        exposes no `disabled` prop. */}
+                                    <fieldset disabled={savingModel} className="m-0 min-w-0 space-y-2 border-0 p-0">
+                                      <div>
+                                        <label className="block text-[11px] text-ink-500 mb-1">{t('me.engineDefaultModel')}</label>
+                                        <Combobox
+                                          ariaLabel={t('me.engineDefaultModel')}
+                                          value={modelInput}
+                                          onValueChange={setModelInput}
+                                          options={engineModelChoices(row.modelCatalog, 'big', {
+                                            follow: t('me.engineModelNotSet'),
+                                            recommended: t('agent.recommended'),
+                                            localDefault: (model) => t('agent.modelLocalDefault', { model }),
+                                          })}
+                                          searchPlaceholder={t('agent.searchModels')}
+                                          allowCustom={row.modelCatalog?.supportsCustom !== false}
+                                          customLabel={(value) => t('agent.useCustomModel', { model: value })}
+                                        />
+                                      </div>
+                                      {/* Engines that never run a separate fast model
+                                          hide the field rather than accept a value the
+                                          server would silently ignore. */}
+                                      {row.modelCatalog?.fastModelScope !== 'unsupported' && (
+                                        <div>
+                                          <label className="block text-[11px] text-ink-500 mb-1">{t('me.engineFastModel')}</label>
+                                          <Combobox
+                                            ariaLabel={t('me.engineFastModel')}
+                                            value={fastModelInput}
+                                            onValueChange={setFastModelInput}
+                                            options={engineModelChoices(row.modelCatalog, 'small', {
+                                              follow: t('me.engineModelNotSet'),
+                                              recommended: t('agent.recommended'),
+                                              localDefault: (model) => t('agent.modelLocalDefault', { model }),
+                                            })}
+                                            searchPlaceholder={t('agent.searchModels')}
+                                            allowCustom={row.modelCatalog?.supportsCustom !== false}
+                                            customLabel={(value) => t('agent.useCustomModel', { model: value })}
+                                          />
+                                        </div>
+                                      )}
+                                    </fieldset>
+                                    <p className="text-[11px] text-ink-500">{t('me.engineModelHelp')}</p>
+                                    {row.modelCatalog?.stale && (
+                                      <p className="text-[11px] text-ink-500">{t('agent.modelCatalogStale')}</p>
+                                    )}
+                                    {catalogTrust(row.modelCatalog) === 'guessed' && (
+                                      <p className="text-[11px] text-ink-500">{t('agent.modelCatalogGuessed')}</p>
+                                    )}
+                                    {catalogTrust(row.modelCatalog) === 'unverified' && (
+                                      <p className="text-[11px] text-ink-500">{t('agent.modelCatalogUnverified')}</p>
+                                    )}
+                                    <div className="flex gap-2">
+                                      <button
+                                        type="button"
+                                        onClick={() => saveEngineDefaults(c.id, row.id)}
+                                        disabled={savingModel}
+                                        className="px-3 py-1 rounded-[7px] text-[11px] font-semibold text-white disabled:opacity-50"
+                                        style={{ background: 'var(--skype)' }}
+                                      >
+                                        {savingModel ? t('common.saving') : t('common.save')}
+                                      </button>
+                                      <button
+                                        type="button"
+                                        onClick={() => setEditingModel(null)}
+                                        className="px-3 py-1 rounded-[7px] text-[11px] font-semibold text-ink-600 hover:bg-ink-50"
+                                      >
+                                        {t('common.cancel')}
+                                      </button>
+                                    </div>
+                                  </div>
+                                ) : (
+                                  <div className="flex items-center justify-between gap-3">
+                                    <div className="min-w-0">
+                                      {(() => {
+                                        const def = c.engineDefaults?.[engineId]
+                                        const main = def?.model?.trim()
+                                        const fast = def?.fastModel?.trim()
+                                        if (!main && !fast) {
+                                          return <span className="text-[11px] text-ink-400">{t('me.engineModelNotSet')}</span>
+                                        }
+                                        return (
+                                          <div className="flex items-center gap-2 flex-wrap">
+                                            {main && (
+                                              <span className="inline-flex items-center gap-1 rounded-[6px] px-1.5 py-0.5 font-mono text-[10.5px] text-ink-700"
+                                                style={{ background: 'var(--ink-100)' }}>
+                                                {main}
+                                              </span>
+                                            )}
+                                            {fast && (
+                                              <span className="inline-flex items-center gap-1 rounded-[6px] px-1.5 py-0.5 font-mono text-[10.5px] text-ink-500"
+                                                style={{ background: 'var(--sky2-100)' }}>
+                                                fast: {fast}
+                                              </span>
+                                            )}
+                                          </div>
+                                        )
+                                      })()}
+                                    </div>
+                                    <button
+                                      type="button"
+                                      onClick={() => startEditModel(
+                                        c.id,
+                                        row.id,
+                                        c.engineDefaults?.[engineId]?.model,
+                                        c.engineDefaults?.[engineId]?.fastModel
+                                      )}
+                                      className="shrink-0 text-[11px] font-semibold text-skype-deep hover:underline"
+                                    >
+                                      {t('me.engineModelConfigure')}
+                                    </button>
+                                  </div>
+                                )}
+                              </div>
+                            )}
+                          </div>
+                        )
+                      })}
+                    </div>
+                  )
+                )}
+                {expanded && (
+                  <div className="px-4 pb-4 pt-3 border-t border-ink-100">
+                    <div className="text-[12px] text-ink-500 mb-2 italic font-display">
+                      {t('me.repairHint', { name: c.name })}
+                    </div>
+                    {!repairCode ? (
+                      <div className="text-[12px] text-ink-400">{t('me.computersGenerating')}</div>
+                    ) : (
+                      <>
+                        <pre className="bg-ink-900 text-cloud rounded-[10px] p-3 text-[12px] overflow-x-auto whitespace-pre-wrap break-all font-mono select-all">{repairCmd}</pre>
+                        <button type="button" onClick={(e) => { e.stopPropagation(); void copyRepairCommand(repairCmd) }}
+                          className="mt-2 inline-flex items-center justify-center min-w-[120px] text-[12px] font-semibold px-3 py-1.5 rounded-[9px] text-white transition-colors duration-200"
+                          style={{ background: repairCopied ? '#3BB273' : 'var(--skype)' }}>
+                          {repairCopied ? t('me.copied') : t('me.copyCommand')}
+                        </button>
+                      </>
+                    )}
+                  </div>
+                )}
+              </div>
+            )
+          })}
+        </div>
+
+        {showPairCommand && code ? (
+          <div className="mt-4 bg-sky2-50 rounded-[14px] p-4" style={{ border: '1px solid var(--sky-100)' }}>
+            <div className="text-[13px] font-semibold text-ink-900 mb-1">
+              {t('me.runOnHost')}
+            </div>
+            {/* biome-ignore lint/security/noDangerouslySetInnerHtml: static copy from the locale bundle, not user input */}
+            <div className="text-[11.5px] text-ink-500 mb-2.5 italic font-display" dangerouslySetInnerHTML={{ __html: t('me.engineRequired') }} />
+            <div className="mb-2.5">
+              <div className="flex items-center gap-2.5 min-w-0">
+                <span className="text-[12px] text-ink-500 shrink-0">{t('me.engineLabel')}</span>
+                <div className="flex-1 min-w-0 overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+                  <div className="inline-flex min-w-max rounded-[9px] p-0.5" style={{ background: 'var(--ink-100)' }}>
+                    {RUNNABLE_ENGINES.map((id) => (
+                      <button key={id} type="button" onClick={() => setEngine(id)}
+                        className="shrink-0 whitespace-nowrap px-3 py-1 rounded-[7px] text-[12px] font-semibold transition-colors duration-150"
+                        style={engine === id
+                          ? { background: 'var(--paper)', color: 'var(--ink-900)', boxShadow: '0 1px 2px rgba(0,0,0,0.08)' }
+                          : { color: 'var(--ink-500)' }}>
+                        {engineLabel(id)}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              </div>
+              <div className="mt-1.5 text-[11px] leading-relaxed text-ink-400">{t('me.engineDefaultHint')}</div>
+            </div>
+            <label className="flex items-start gap-2 mb-2.5 cursor-pointer select-none">
+              <input type="checkbox" checked={asService} onChange={(e) => setAsService(e.target.checked)} className="mt-[3px]" />
+              <span className="text-[12px] text-ink-600">
+                {t('me.keepInBackground')} <span className="text-ink-400">— {t('me.keepInBackgroundDetail')}</span>
+              </span>
+            </label>
+            <pre className="bg-ink-900 text-cloud rounded-[10px] p-3 text-[12px] overflow-x-auto whitespace-pre-wrap break-all font-mono select-all">{pairCommand}</pre>
+            <div className="flex gap-2 mt-3">
+              <button type="button" onClick={copyCommand} aria-live="polite"
+                className="inline-flex items-center justify-center gap-1.5 min-w-[128px] text-[12px] font-semibold px-3 py-1.5 rounded-[9px] text-white transition-colors duration-200"
+                style={{ background: copied ? '#3BB273' : 'var(--skype)' }}>
+                {copied ? (
+                  <>
+                    <svg key="ck" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                      strokeWidth="3" strokeLinecap="round" strokeLinejoin="round"
+                      style={{ animation: 'cp-pop 0.32s cubic-bezier(.36,1.6,.4,1)' }}>
+                      <polyline points="20 6 9 17 4 12" />
+                    </svg>
+                    <span style={{ animation: 'cp-fade 0.2s ease' }}>{t('me.copiedShort')}</span>
+                  </>
+                ) : t('me.copyCommand')}
+              </button>
+              <button type="button" onClick={() => { setShowPairCommand(false); usePairingCodes.getState().clear() }}
+                className="text-[12px] font-semibold px-3 py-1.5 rounded-[9px] border border-ink-100 text-ink-600">{t('me.done')}</button>
+            </div>
+            <style>{`
+              @keyframes cp-pop { 0% { transform: scale(0.2); opacity: 0 } 55% { transform: scale(1.3) } 100% { transform: scale(1); opacity: 1 } }
+              @keyframes cp-fade { from { opacity: 0; transform: translateX(-2px) } to { opacity: 1; transform: none } }
+            `}</style>
+          </div>
+        ) : (
+          <button type="button" onClick={addComputer} disabled={busy}
+            className="mt-4 px-4 py-2 rounded-[10px] bg-skype text-white text-[13px] font-semibold disabled:opacity-50">
+            {busy ? t('me.computersGenerating') : t('me.addComputer')}
+          </button>
+        )}
+      </Section>
+    </div>
+  )
+}
+
+function Section({ title, children }: { title: string; children: React.ReactNode }) {
+  return (
+    <div>
+      <h4 className="text-[10.5px] font-extrabold text-skype tracking-[0.14em] uppercase mb-3">{title}</h4>
+      {children}
+    </div>
+  )
+}
+
+/** Elegant, self-clearing "your daemon is behind" banner. Shows the moment any
+ *  paired computer reports an outdated `cumora` daemon, and disappears on its own
+ *  once the daemon restarts onto the latest (the next heartbeat clears the flag).
+ *  Warm gold (an invitation to update), not alarm red. One-click copy. */
+function DaemonUpgradeBanner({ onJump }: { onJump: () => void }) {
+  const t = useT()
+  const byId = useComputers((s) => s.byId)
+  const [copied, setCopied] = useState(false)
+  const outdated = Object.values(byId).filter((c) => c.daemonOutdated)
+  if (outdated.length === 0) return null
+
+  const latest = outdated.map((c) => c.latestDaemonVersion).find(Boolean) ?? null
+  const one = outdated.length === 1 ? outdated[0] : null
+  // Run-mode-aware instructions. A supervised daemon (--install-service) is
+  // restarted through its launchd/systemd wrapper; a manually-run foreground
+  // daemon has no wrapper — the user must Ctrl-C it and re-run the command.
+  // Unknown (old daemon not reporting the mode yet) gets the service command,
+  // which itself prints install-service guidance when no service exists.
+  const manual = outdated.filter((c) => c.daemonSupervised === false)
+  const allManual = manual.length === outdated.length
+  const cmd = allManual ? 'npx cumora@latest agent computer' : 'npx cumora@latest agent computer --restart'
+  const copy = () => { void navigator.clipboard?.writeText(cmd); setCopied(true); window.setTimeout(() => setCopied(false), 1600) }
+
+  return (
+    <div className="relative overflow-hidden rounded-[16px] mb-6"
+      style={{ border: '1px solid rgba(244,183,64,0.45)', background: 'linear-gradient(135deg, rgba(244,183,64,0.15), rgba(244,183,64,0.035) 70%)' }}>
+      <div className="p-4 flex items-start gap-4">
+        <div className="shrink-0 mt-0.5 w-9 h-9 rounded-full flex items-center justify-center text-[17px] font-bold"
+          style={{ background: 'rgba(244,183,64,0.22)', color: 'var(--gold-deep)' }}>↑</div>
+        <div className="flex-1 min-w-0">
+          <div className="flex items-center gap-2.5 flex-wrap">
+            <span className="font-display font-semibold text-[15px] text-ink-900">{t('me.updateAvailableTitle')}</span>
+            {latest && (
+              <span className="inline-flex items-center gap-1.5 text-[11px] font-mono">
+                {one?.daemonVersion && (
+                  <span className="px-1.5 py-0.5 rounded-full" style={{ background: 'var(--ink-100)', color: 'var(--ink-500)' }}>{t('me.daemonVersion', { version: one.daemonVersion })}</span>
+                )}
+                <span className="text-ink-300">→</span>
+                <span className="px-1.5 py-0.5 rounded-full font-semibold" style={{ background: 'rgba(244,183,64,0.30)', color: 'var(--gold-deep)' }}>{t('me.daemonVersion', { version: latest })}</span>
+              </span>
+            )}
+          </div>
+          <div className="text-[12.5px] text-ink-600 mt-1 leading-relaxed">
+            {one ? (
+              <><strong className="text-ink-900 font-medium">{one.name}</strong>{' '}{t('me.daemonOutdatedOne')}</>
+            ) : (
+              <><strong className="text-ink-900 font-medium">{outdated.length}</strong> {t('me.daemonOutdatedMany', { n: outdated.length, names: outdated.map((c) => c.name).join(', ') })}</>
+            )}
+            {allManual ? (
+              <>{' '}{one ? t('me.daemonManualHelp') : t('me.daemonManualHelpPlural')}</>
+            ) : (
+              <>
+                {' '}{one ? t('me.daemonAutoHelp') : t('me.daemonAutoHelpPlural')}
+                {manual.length > 0 && (
+                  <>{' '}({manual.map((c) => c.name).join(', ')} {manual.length === 1 ? t('me.daemonManualInfix') : t('me.daemonManualInfixPlural')} {t('me.daemonManualRun')} — Ctrl-C and re-run there instead.)</>
+                )}
+              </>
+            )}
+          </div>
+          <div className="mt-2.5 flex items-stretch gap-2 max-w-[580px]">
+            <code className="flex-1 bg-ink-900 text-cloud rounded-[10px] px-3 py-2 text-[12px] font-mono overflow-x-auto whitespace-nowrap select-all flex items-center">{cmd}</code>
+            <button type="button" onClick={copy}
+              className="shrink-0 inline-flex items-center justify-center min-w-[82px] text-[12px] font-semibold px-3 rounded-[10px] text-white transition-colors duration-200"
+              style={{ background: copied ? 'var(--avail)' : 'var(--gold-deep)' }}>
+              {copied ? t('me.copiedShort') : t('me.copy')}
+            </button>
+          </div>
+          <button type="button" onClick={onJump} className="mt-2 text-[11.5px] font-semibold text-gold-deep hover:underline" style={{ color: 'var(--gold-deep)' }}>
+            {t('me.manageComputers')}
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+export function MeView() {
+  const t = useT()
+  const [tab, setTab] = useState<Tab>('profile')
+  // Fast refresh can retain a tab that was removed while this page was open.
+  useEffect(() => {
+    if (!tabs.some(item => item.key === tab)) setTab('profile')
+  }, [tab])
+  const hasOutdated = useComputers((s) => Object.values(s.byId).some((c) => c.daemonOutdated))
+  useEffect(() => { void useComputers.getState().refresh() }, [])
+
+  return (
+    <main className="overflow-y-auto p-8 pt-6"
+      style={{ background: 'linear-gradient(180deg, transparent, var(--paper))' }}>
+      <div className="max-w-[1100px] mx-auto">
+        <div className="mb-6">
+          <h1 className="font-display font-medium text-[36px] tracking-tight text-ink-900 mb-1" style={{ letterSpacing: '-0.025em' }}>
+            {t('me.headline')}
+          </h1>
+          <div className="font-display italic font-normal text-[15px] text-ink-500">
+            {t('me.subtitle')}
+          </div>
+        </div>
+
+        <DaemonUpgradeBanner onJump={() => setTab('computers')} />
+
+        <div className="flex gap-1 mb-7 border-b border-ink-100">
+          {tabs.map((tabDef, i) => (
+            <button
+              type="button"
+              key={tabDef.key}
+              onClick={() => setTab(tabDef.key)}
+              className={cn(
+                'py-2.5 text-[13px] font-semibold border-b-2 transition -mb-px inline-flex items-center gap-1.5',
+                i === 0 ? 'pl-0 pr-5' : 'px-5',
+                tab === tabDef.key ? 'border-skype text-skype-deep' : 'border-transparent text-ink-500 hover:text-ink-700',
+              )}>
+              {t(tabDef.label)}
+              {tabDef.key === 'computers' && hasOutdated && (
+                <span className="w-1.5 h-1.5 rounded-full" style={{ background: 'var(--gold-deep)' }} title={t('me.daemonNeedsUpdate')} />
+              )}
+            </button>
+          ))}
+        </div>
+
+        {tab === 'profile' && <ProfileTab />}
+        {tab === 'computers' && <ComputersTab />}
+        {tab === 'projects' && <ProjectsTab />}
+        {tab === 'trust' && <TrustTab />}
+        {tab === 'preferences' && <PreferencesTab />}
+      </div>
+    </main>
+  )
+}

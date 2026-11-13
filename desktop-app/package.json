@@ -1,0 +1,24 @@
+{
+  "name": "cumora-local-desktop",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Cumora local desktop client",
+  "author": "Cumora local",
+  "license": "MIT",
+  "main": "electron/main.cjs",
+  "scripts": {
+    "pack": "electron-builder --win dir --publish never"
+  },
+  "dependencies": { "electron-updater": "6.8.3" },
+  "devDependencies": { "electron": "45.3.1", "electron-builder": "26.18.0" },
+  "build": {
+    "appId": "local.cumora.discussion",
+    "productName": "Cumora AI聊天群",
+    "asar": true,
+    "files": ["electron/**/*", "build/**/*", "package.json"],
+    "extraResources": [{"from":"desktop-local.json","to":"desktop-local.json"}],
+    "directories": {"output":"release","buildResources":"build"},
+    "win": {"icon":"build/icons/icon.ico","signExecutable":false,"target":"dir"},
+    "publish": null
+  }
+}

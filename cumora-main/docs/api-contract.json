@@ -1,0 +1,44 @@
+{
+  "schemaVersion": 1,
+  "http": {
+    "urlVersion": null,
+    "humanAuth": ["authorization: Bearer", "x-session-token"],
+    "humanTenantHeader": "x-company-id",
+    "cookieSession": false,
+    "authMiddlewareRejects": false,
+    "runtimeAuth": "authorization: Bearer <agent-runtime JWT>",
+    "inboundEmailAuth": "x-cumora-signature HMAC of the raw body",
+    "errorShape": { "error": "string" }
+  },
+  "websocket": {
+    "scope": "one socket per user, all of that user's workspaces",
+    "delivery": "user id after dropping untagged Redis events",
+    "eventTypes": [
+      "hello",
+      "message.new",
+      "message.delta",
+      "typing",
+      "participants.status",
+      "participants.avatar",
+      "computers.status",
+      "participants.added",
+      "participants.roster_changed",
+      "message.reactions",
+      "group.pulled",
+      "conversation.updated",
+      "convene",
+      "board.changed",
+      "doc.sync",
+      "doc.update",
+      "doc.awareness",
+      "doc.error",
+      "doc.changed",
+      "doc.mention",
+      "calendar.reminder",
+      "calendar.changed",
+      "poll.updated",
+      "workspace.membership"
+    ],
+    "clientDeclaresCompanyId": ["participants.added", "workspace.membership"]
+  }
+}

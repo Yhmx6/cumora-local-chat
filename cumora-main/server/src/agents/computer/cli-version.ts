@@ -1,0 +1,628 @@
+/** Engine version probing, run on the daemon's own machine.
+ *
+ *  The Computers tab shows, per engine, the version installed on *that*
+ *  computer. Only the daemon can answer that — the desktop app can scan its own
+ *  PATH, but that is a different machine whenever you are not sitting at the one
+ *  you paired. So the probe lives here and rides the heartbeat's engine rescan.
+ *
+ *  Local versions are re-probed on every rescan (cheap: one spawn per engine,
+ *  against an already-resolved absolute path). Upstream "latest" lookups hit the
+ *  network — or a slow `about` / `update --check` subcommand — so they are cached
+ *  well past the rescan interval.
+ */
+
+import { spawn } from 'node:child_process'
+import fs from 'node:fs'
+import path from 'node:path'
+
+interface CommandInvocation {
+  command: string
+  args: string[]
+  windowsVerbatimArguments?: boolean
+}
+
+/** npm on Windows installs an extensionless POSIX shim before the runnable
+ * `.cmd` shim in `where` output. CreateProcess cannot execute either file
+ * directly, so select the sibling batch shim and invoke it through ComSpec. */
+export function versionCommandInvocation(
+  command: string,
+  args: string[],
+  platform = process.platform,
+  comspec = process.env.ComSpec || 'cmd.exe',
+  forceShell = false,
+): CommandInvocation {
+  if (platform !== 'win32') return { command, args }
+
+  let runnable = command
+  if (!/\.(?:cmd|bat|com|exe)$/i.test(runnable)) {
+    for (const ext of ['.cmd', '.bat', '.exe', '.com']) {
+      if (fs.existsSync(`${command}${ext}`)) {
+        runnable = `${command}${ext}`
+        break
+      }
+    }
+  }
+  if (!forceShell && !/\.(?:cmd|bat)$/i.test(runnable)) return { command: runnable, args }
+  return comspecInvocation(comspec, runnable, args)
+}
+
+/** cmd.exe `/s /c` with one quoted command line. Node's `shell: true` joins
+ * argv without quoting, so a model id containing `&` becomes a second command.
+ * Arguments outside the unquoted token set are quoted; quotes inside them are
+ * doubled, which is cmd's escape. */
+function comspecInvocation(comspec: string, runnable: string, args: string[]): CommandInvocation {
+  const commandArgs = args.map((arg) => {
+    const value = String(arg)
+    return /^[\w./:=+-]+$/u.test(value) ? value : `"${value.replace(/"/g, '""')}"`
+  })
+  const commandLine = `""${runnable}"${commandArgs.length ? ` ${commandArgs.join(' ')}` : ''}"`
+  return {
+    command: comspec,
+    args: ['/d', '/s', '/c', commandLine],
+    windowsVerbatimArguments: true,
+  }
+}
+
+/** How to ask an engine its version, and how to find out what the newest one is. */
+export interface EngineVersionSpec {
+  /** Args that make the binary print its version (`--version` for all but hermes). */
+  versionArgs: string[]
+  /** npm package, when the CLI ships on the public registry. */
+  npm?: string
+  /** Extra flags the vendor documents for a global install (pi needs --ignore-scripts). */
+  npmFlags?: string
+  /** Homebrew formula, when the CLI is also brewable. */
+  brew?: string
+  /** The vendor's own updater, preferred over brew/npm when it exists. */
+  selfUpdate?: string
+  /** Restrict a vendor updater to binaries owned by its standalone installer. */
+  selfUpdatePath?: RegExp
+  /** CLIs that report upstream themselves instead of via the npm registry. */
+  latestVia?: 'cursor-about' | 'grok-check'
+}
+
+/** Keep in sync with src/lib/engines.ts (ENGINE_LABEL / ENGINE_BIN /
+ *  RUNNABLE_ENGINE_IDS) and, for engines Cumora can actually wake, ENGINE_IDS
+ *  in agents/computer/engine.ts. */
+export const ENGINE_VERSION_SPECS: Record<string, EngineVersionSpec> = {
+  claude: {
+    versionArgs: ['--version'],
+    npm: '@anthropic-ai/claude-code',
+    brew: 'claude-code',
+    selfUpdate: 'claude update',
+  },
+  cursor: {
+    versionArgs: ['--version'],
+    latestVia: 'cursor-about',
+    selfUpdate: 'cursor-agent update',
+  },
+  codex: {
+    versionArgs: ['--version'],
+    npm: '@openai/codex',
+    brew: 'codex',
+    selfUpdate: 'codex update',
+    selfUpdatePath: /[/\\]\.codex[/\\]packages[/\\]standalone[/\\]/i,
+  },
+  grok: {
+    versionArgs: ['--version'],
+    latestVia: 'grok-check',
+    npm: '@xai-official/grok',
+    selfUpdate: 'grok update',
+  },
+  opencode: {
+    versionArgs: ['--version'],
+    npm: 'opencode-ai',
+    selfUpdate: 'opencode upgrade',
+  },
+  pi: {
+    versionArgs: ['--version'],
+    npm: '@earendil-works/pi-coding-agent',
+    npmFlags: '--ignore-scripts',
+    selfUpdate: 'pi update',
+  },
+  gemini: {
+    versionArgs: ['--version'],
+    npm: '@google/gemini-cli',
+    brew: 'gemini-cli',
+  },
+  qwen: {
+    versionArgs: ['--version'],
+    npm: '@qwen-code/qwen-code',
+  },
+  antigravity: {
+    versionArgs: ['--version'],
+    selfUpdate: 'agy update',
+  },
+  zcode: {
+    versionArgs: ['--version'],
+  },
+  maka: {
+    versionArgs: ['--version'],
+    selfUpdate: 'maka update --target latest',
+  },
+  omp: {
+    versionArgs: ['--version'],
+    npm: '@oh-my-pi/pi-coding-agent',
+    selfUpdate: 'omp update',
+  },
+  hermes: {
+    versionArgs: ['version'],
+    selfUpdate: 'hermes update',
+  },
+}
+
+/** Upstream versions change on the vendor's release cadence, not ours, and the
+ *  rescan runs every 5 minutes. Cache far longer than the rescan so a paired
+ *  machine is not making the same registry call all day. A stale `latest` only
+ *  delays noticing a new release; it never produces a wrong "outdated" badge,
+ *  because the *local* side of the comparison is always freshly probed. */
+const LATEST_TTL_MS = 6 * 60 * 60 * 1000
+
+const latestCache = new Map<string, { at: number; version: string | null }>()
+
+/** Test seam: drop memoized upstream versions. */
+export function clearLatestCache(): void {
+  latestCache.clear()
+}
+
+/** Pull the first version-looking token out of CLI output. Accepts both semver
+ *  and the CalVer some vendors print (`2026.08.30`). */
+/** Lines that carry a version number but never the CLI's OWN version.
+ *
+ *  `npm warn EBADENGINE Unsupported engine { required: { node: '>=20.19.0' } }`
+ *  and `(node:1234) [DEP0040] DeprecationWarning: …` both routinely precede a
+ *  CLI's real output, and both contain something that looks exactly like a
+ *  version. Taking the first match in the combined stream then reads the
+ *  warning's number as the engine's version — which is how a Claude Code 2.0.9
+ *  came back as "20.19.0" and satisfied the 2.1.248 secure floor. The gate that
+ *  exists to refuse an un-sandboxable CLI failed OPEN on unrelated noise. */
+const VERSION_NOISE_LINE =
+  /^\s*(?:npm\s+(?:warn|WARN|notice|err)|\(node:\d+\)|warning:|warn\b|deprecat|debugger\s|\[dep\d)/i
+
+const VERSION_TOKEN = /v?(\d{4}\.\d{2}\.\d{2}(?:-[\w.]+)?|\d+\.\d+\.\d+(?:[-+][\w.]+)?)/i
+
+/** The version a command reported. stdout is what a CLI prints its own version
+ *  on, so it is asked first; stderr is only a fallback for the engines that
+ *  report there, and can no longer outrank the real answer. */
+export function versionFromOutput(out: CommandOutput): string | null {
+  return parseCliVersion(out.stdout) ?? parseCliVersion(out.stderr)
+}
+
+/** The version a CLI reported, ignoring lines that are someone else's version.
+ *
+ *  Scans line by line rather than the blob so a warning cannot win merely by
+ *  arriving first. */
+export function parseCliVersion(text: string | null | undefined): string | null {
+  if (!text) return null
+  // Warnings are frequently multi-line, and only the FIRST line carries the
+  // marker — npm's EBADENGINE puts the version on an indented continuation:
+  //   npm warn EBADENGINE Unsupported engine {
+  //     required: { node: '>=20.19.0' }
+  //   }
+  // So a line is noise if it announces itself as one, or if it is a
+  // continuation of one: indented, or a bare closing brace. Suppression only
+  // ever begins after a marker line, so output with no warnings is untouched.
+  let inNoise = false
+  for (const line of String(text).split(/\r?\n/)) {
+    if (VERSION_NOISE_LINE.test(line)) { inNoise = true; continue }
+    if (inNoise && (/^\s+\S/.test(line) || /^\s*[)}\]]+[,;]?\s*$/.test(line) || line.trim() === '')) continue
+    inNoise = false
+    const m = line.match(VERSION_TOKEN)
+    if (m) return m[1]
+  }
+  return null
+}
+
+function versionParts(v: string): number[] {
+  const main = String(v).replace(/^v/i, '').split(/[-+]/)[0] ?? ''
+  return main.split('.').map((n) => Number.parseInt(n, 10) || 0)
+}
+
+/** Semver/CalVer floor used for local capability gates. A prerelease at the
+ * exact numeric floor remains below the final release; unknown versions fail
+ * closed at the caller. */
+export function isCliVersionAtLeast(current: string | null, minimum: string): boolean {
+  if (!current) return false
+  const a = versionParts(current)
+  const b = versionParts(minimum)
+  const n = Math.max(a.length, b.length)
+  for (let i = 0; i < n; i++) {
+    const x = a[i] ?? 0
+    const y = b[i] ?? 0
+    if (x > y) return true
+    if (x < y) return false
+  }
+  const currentMain = current.trim().replace(/^v/i, '').split('+', 1)[0]
+  const minimumMain = minimum.trim().replace(/^v/i, '').split('+', 1)[0]
+  return !(currentMain.includes('-') && !minimumMain.includes('-'))
+}
+
+/** True only when `latest` is strictly newer. Unknown on either side means we
+ *  say nothing rather than nag. */
+export function isCliOutdated(current: string | null, latest: string | null): boolean {
+  if (!current || !latest) return false
+  if (current === latest) return false
+  const a = versionParts(current)
+  const b = versionParts(latest)
+  const n = Math.max(a.length, b.length)
+  for (let i = 0; i < n; i++) {
+    const x = a[i] ?? 0
+    const y = b[i] ?? 0
+    if (y > x) return true
+    if (y < x) return false
+  }
+  return false
+}
+
+function realpathOf(binPath: string): string {
+  try {
+    return fs.realpathSync(binPath)
+  } catch {
+    return binPath
+  }
+}
+
+/** npm's Windows shims are a few hundred bytes; anything larger is not one, and
+ *  reading a real binary looking for a package name would be pointless work. */
+const SHIM_READ_LIMIT = 64 * 1024
+
+/** The package directory `file` sits inside, when that directory is in a
+ *  node_modules tree — `…/node_modules/@openai/codex/bin/codex.js` is in
+ *  @openai/codex. */
+function owningPackageDir(file: string): string | null {
+  for (let dir = path.dirname(file); ; dir = path.dirname(dir)) {
+    const parent = path.dirname(dir)
+    if (parent === dir) return null
+    const above = path.basename(parent)
+    // `<pkg>` directly under node_modules, or `<@scope>/<pkg>` under it.
+    if (above === 'node_modules') return dir
+    if (above.startsWith('@') && path.basename(path.dirname(parent)) === 'node_modules') return dir
+  }
+}
+
+/** The version the package containing `file` records, or null when `file` is in
+ *  none — the read half of `npmPackageVersion`, shared by both shapes. */
+function versionOfOwner(file: string): string | null {
+  const owner = owningPackageDir(realpathOf(file))
+  return owner ? versionFromPackageJson(owner) : null
+}
+
+/** The path a shim names at `at`, the position of its `/node_modules/`: the text
+ *  before that is the directory the line starts from — the shim's own (`%dp0%`,
+ *  `%~dp0`, `$basedir`) or a real path — and the text after it runs to the end of
+ *  the quoted path. pnpm keeps a store directory in between
+ *  (`…/global/5/node_modules`), so the prefix is resolved, not assumed to sit
+ *  beside the shim. Null when a variable is left unexpanded: a name nothing can
+ *  be read from. */
+function shimPathAt(flat: string, at: number, shimDir: string): string | null {
+  // pnpm quotes every path it writes, and a global directory may hold a space
+  // (`…/global packages/5/…`), so a quoted span — not whitespace — is the
+  // boundary when there is one. Quotes never span a line in a shim.
+  const from = flat.lastIndexOf('\n', at) + 1
+  let to = flat.indexOf('\n', at)
+  if (to < 0) to = flat.length
+  let span: [number, number] | null = null
+  let open = -1
+  let quote = ''
+  for (let i = from; i < to && !span; i++) {
+    const ch = flat.charAt(i)
+    if (!quote) {
+      if (ch === '"' || ch === "'") {
+        quote = ch
+        open = i
+      }
+    } else if (ch === quote) {
+      if (at > open && at < i) span = [open + 1, i]
+      quote = ''
+    }
+  }
+  if (!span && quote && at > open) span = [open + 1, to]
+  if (!span) {
+    let start = at
+    while (start > from && !/[\s(=;,`]/.test(flat.charAt(start - 1))) start--
+    let stop = at
+    while (stop < to && !/[\s);,`]/.test(flat.charAt(stop))) stop++
+    span = [start, stop]
+  }
+  let token = flat.slice(span[0], span[1])
+  const self = /^(?:%~dp0|%dp0%|\$basedir|\$\{basedir\})\/?/i.exec(token)
+  if (self) token = token.slice(self[0].length).replace(/^\/+/, '')
+  if (/[%$]/.test(token)) return null
+  return path.resolve(shimDir, token)
+}
+
+function versionFromPackageJson(pkgDir: string): string | null {
+  try {
+    const raw = fs.readFileSync(path.join(pkgDir, 'package.json'), 'utf8')
+    const version = (JSON.parse(raw) as { version?: unknown }).version
+    return typeof version === 'string' ? parseCliVersion(version) : null
+  } catch {
+    return null
+  }
+}
+
+/** The version recorded by the npm package that owns `binPath`, or null when it
+ *  belongs to none — read, never run.
+ *
+ *  Two shapes, because npm puts a shim *beside* node_modules rather than a link
+ *  into it: a path already inside the package tree is answered by walking up to
+ *  its package.json, while `C:\…\opencode` (the shim) only names the package in
+ *  its text (`%dp0%\node_modules\opencode-ai\bin\opencode.exe`). Magpie splits
+ *  these the same way, as npmVersion and shimVersion. pnpm's shim is the second
+ *  shape with the store in the middle — `%~dp0\..\global\5\node_modules\…` — so
+ *  the path is resolved from the shim's directory instead of assumed beside it.
+ *
+ *  This exists because an installed CLI can fail to answer: opencode-ai ships a
+ *  placeholder `bin/opencode.exe` until its postinstall runs, and that
+ *  placeholder exits with an error instead of a version — so the Computers tab
+ *  read "版本未知" for a CLI whose package plainly said 1.19.4. */
+export function npmPackageVersion(binPath: string | null): string | null {
+  if (!binPath) return null
+  const real = realpathOf(binPath)
+  const owned = versionOfOwner(real)
+  if (owned) return owned
+
+  let text: string
+  try {
+    const stat = fs.statSync(real)
+    if (!stat.isFile() || stat.size > SHIM_READ_LIMIT) return null
+    text = fs.readFileSync(real, 'utf8')
+  } catch {
+    return null
+  }
+  // Shims spell the path with the separator of the platform they came from, and
+  // a pnpm shim mentions several; take the first that names an installed package.
+  const flat = text.replace(/\\/g, '/')
+  for (let at = flat.indexOf('/node_modules/'); at >= 0; at = flat.indexOf('/node_modules/', at + 1)) {
+    const target = shimPathAt(flat, at, path.dirname(real))
+    const version = target ? versionOfOwner(target) : null
+    if (version) return version
+  }
+  return null
+}
+
+/** What this machine has installed for one engine: what the CLI prints, else
+ *  what its npm package records.
+ *
+ *  Asked in that order deliberately, unlike magpie (which reads the package
+ *  first and so never runs an npm CLI): `claude update` and `codex update`
+ *  replace the binary in place, so the printed version describes what will
+ *  actually run while package.json can lag behind it. The package is only the
+ *  fallback for a CLI that cannot answer at all — which is the whole bug. */
+async function installedVersion(id: string, binPath: string): Promise<string | null> {
+  const spec = ENGINE_VERSION_SPECS[id]
+  if (!spec) return null
+  const printed = versionFromOutput(await spawnCommand(binPath, spec.versionArgs, 6000))
+  return printed ?? npmPackageVersion(binPath)
+}
+
+export function isHomebrewInstall(real: string, formula: string): boolean {
+  // npm under Homebrew's Node belongs to npm, not the Node formula's keg.
+  return real.match(/(?:^|[/\\])(?:Cellar|Caskroom)[/\\]([^/\\]+)[/\\]/i)?.[1] === formula
+}
+
+/** Prefer the CLI's own updater when it has one (`pi update`, `claude update`):
+ *  that is the path vendors document, and it behaves the same on Windows. Fall
+ *  back to brew only when the binary actually came from brew, else npm. */
+export function inferUpdateCommand(spec: EngineVersionSpec, binPath: string | null): string | null {
+  if (spec.selfUpdate && (!spec.selfUpdatePath || (binPath && spec.selfUpdatePath.test(realpathOf(binPath))))) {
+    return spec.selfUpdate
+  }
+  if (spec.brew && binPath && isHomebrewInstall(realpathOf(binPath), spec.brew)) {
+    return `brew upgrade ${spec.brew}`
+  }
+  if (!spec.npm) return null
+  return `npm install -g ${spec.npmFlags ? `${spec.npmFlags} ` : ''}${spec.npm}@latest`
+}
+
+export function parseCursorAbout(text: string): string | null {
+  const latestLine = text.split(/\r?\n/).find((line) => /^\s*Latest\b/i.test(line))
+  if (!latestLine) return null
+  return parseCliVersion(latestLine)
+}
+
+export function parseGrokCheck(text: string): string | null {
+  try {
+    const data = JSON.parse(text) as Record<string, unknown>
+    return typeof data.latestVersion === 'string' ? data.latestVersion : null
+  } catch {
+    return parseCliVersion(text)
+  }
+}
+
+export interface CommandOutput {
+  stdout: string
+  stderr: string
+  /** stdout first — the order every combined-text caller wants. */
+  combined: string
+  /** Exit code, or null when it never ran or was killed on timeout. */
+  code?: number | null
+}
+
+/** Run a command and return its output, or empty strings on any failure. Never
+ *  rejects: a missing or wedged CLI must not take down the rescan.
+ *
+ *  The streams are returned APART because they mean different things: a CLI
+ *  prints its version on stdout and its warnings on stderr, and merging them
+ *  let an `npm warn EBADENGINE … node: '>=20.19.0'` line stand in for an
+ *  engine's version at the secure floor. */
+function spawnCommand(cmd: string, args: string[], timeoutMs: number, forceShell = false): Promise<CommandOutput> {
+  return new Promise((resolve) => {
+    let settled = false
+    let child: ReturnType<typeof spawn>
+    try {
+      const invocation = versionCommandInvocation(cmd, args, process.platform, undefined, forceShell)
+      child = spawn(invocation.command, invocation.args, {
+        stdio: ['ignore', 'pipe', 'pipe'],
+        windowsHide: true,
+        windowsVerbatimArguments: invocation.windowsVerbatimArguments === true,
+      })
+    } catch {
+      resolve({ stdout: '', stderr: '', combined: '', code: null })
+      return
+    }
+    // Kept apart, then joined stdout-first. A CLI prints its version on stdout
+    // and its warnings on stderr, so scanning stdout first means a warning
+    // cannot win by arriving earlier — which is what let an npm EBADENGINE
+    // line stand in for an engine's version at the secure floor. Some engines
+    // do report the version on stderr, so it stays in the text, just after.
+    let stdout = ''
+    let stderr = ''
+    child.stdout?.on('data', (buf: Buffer) => { stdout += buf.toString('utf8') })
+    child.stderr?.on('data', (buf: Buffer) => { stderr += buf.toString('utf8') })
+    const captured = (code: number | null): CommandOutput => ({
+      stdout: stdout.trim(),
+      stderr: stderr.trim(),
+      combined: `${stdout}\n${stderr}`.trim(),
+      code,
+    })
+    const finish = (value: CommandOutput) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      resolve(value)
+    }
+    const timer = setTimeout(() => {
+      // shortcut: kills the direct child only, so a wedged npm.cmd can outlive
+      // this on Windows; upgrade to a process-tree kill if that shows up.
+      try { child.kill() } catch { /* already gone */ }
+      finish(captured(null))
+    }, timeoutMs)
+    child.on('error', () => finish({ stdout: '', stderr: '', combined: '', code: null }))
+    child.on('close', (code) => finish(captured(code)))
+  })
+}
+
+async function npmLatest(pkg: string): Promise<string | null> {
+  try {
+    const res = await fetch(`https://registry.npmjs.org/${encodeURIComponent(pkg)}/latest`, {
+      headers: { 'User-Agent': 'cumora-daemon', Accept: 'application/json' },
+      signal: AbortSignal.timeout(5000),
+    })
+    if (!res.ok) return null
+    const data = await res.json() as Record<string, unknown>
+    return typeof data.version === 'string' ? data.version : null
+  } catch {
+    return null
+  }
+}
+
+async function probeLatest(id: string, spec: EngineVersionSpec, binPath: string | null): Promise<string | null> {
+  const cached = latestCache.get(id)
+  if (cached && Date.now() - cached.at < LATEST_TTL_MS) return cached.version
+
+  let version: string | null = null
+  try {
+    if (spec.latestVia === 'cursor-about' && binPath) {
+      const about = (await spawnCommand(binPath, ['about'], 10_000)).combined
+      version = parseCursorAbout(about) || parseCliVersion(about)
+    } else if (spec.latestVia === 'grok-check' && binPath) {
+      const check = (await spawnCommand(binPath, ['update', '--check', '--json'], 12_000)).combined
+      version = parseGrokCheck(check)
+    }
+    if (!version && spec.npm) version = await npmLatest(spec.npm)
+  } catch {
+    version = null
+  }
+  latestCache.set(id, { at: Date.now(), version })
+  return version
+}
+
+/** What the daemon reports per engine, beyond the bin path. */
+export interface EngineVersionInfo {
+  version: string | null
+  latest: string | null
+  outdated: boolean
+  updateCommand: string | null
+}
+
+/** Probe one engine on this machine. `binPath` is the already-resolved absolute
+ *  path, so this never depends on the daemon's PATH being as rich as a shell's. */
+export async function probeEngineVersion(id: string, binPath: string | null): Promise<EngineVersionInfo> {
+  const spec = ENGINE_VERSION_SPECS[id]
+  const empty: EngineVersionInfo = { version: null, latest: null, outdated: false, updateCommand: null }
+  if (!spec || !binPath) return empty
+
+  const version = await installedVersion(id, binPath)
+  const latest = await probeLatest(id, spec, binPath)
+  const outdated = isCliOutdated(version, latest)
+  return {
+    version,
+    latest,
+    outdated,
+    updateCommand: outdated ? inferUpdateCommand(spec, binPath) : null,
+  }
+}
+
+/** Local-only version probe for security capability gates. Unlike
+ * probeEngineVersion(), this never contacts npm or an engine updater — and,
+ * unlike it, never falls back to package.json either: this answer decides
+ * whether a binary may run under the sandbox, so a CLI that cannot say what it
+ * is stays unverified rather than borrowing the version of the package it was
+ * installed from. */
+export async function probeLocalEngineVersion(id: string, binPath: string | null): Promise<string | null> {
+  const spec = ENGINE_VERSION_SPECS[id]
+  if (!spec || !binPath) return null
+  return versionFromOutput(await spawnCommand(binPath, spec.versionArgs, 6000))
+}
+
+/** Retry only an inconclusive local version probe. A concrete version (whether
+ * compatible or too old) is authoritative and returns immediately. Delays are
+ * injectable so the retry contract can be tested without wall-clock sleeps. */
+export async function probeLocalEngineVersionWithRetry(
+  id: string,
+  binPath: string | null,
+  retryDelaysMs: readonly number[] = [0, 250, 1000],
+): Promise<string | null> {
+  if (!binPath) return null
+  for (const delayMs of retryDelaysMs) {
+    if (delayMs > 0) await new Promise<void>((resolve) => setTimeout(resolve, delayMs))
+    const version = await probeLocalEngineVersion(id, binPath)
+    if (version) return version
+  }
+  return null
+}
+
+/** A global npm install or a brew upgrade downloads and unpacks: minutes, not
+ *  seconds, on a slow link. */
+const UPDATE_TIMEOUT_MS = 10 * 60 * 1000
+
+/** The update as argv. The CLI's own updater is named after the CLI (`claude
+ *  update`), and on Windows a bare `claude` is a `.cmd` shim only cmd.exe can
+ *  start — so the resolved path takes its place. npm and brew stay as they are:
+ *  they are package managers, not the CLI. */
+export function updateArgv(command: string, binPath: string | null): string[] {
+  const argv = command.split(/\s+/)
+  if (binPath && argv[0] !== 'npm' && argv[0] !== 'brew') argv[0] = binPath
+  return argv
+}
+
+/** Run one engine's update on this machine and say whether it worked.
+ *
+ *  The command is derived here from the same spec that produced the command the
+ *  app shows, and only the engine *id* ever crosses the wire — a request can
+ *  pick which known updater runs, never what it is.
+ *
+ *  shortcut: the daemon's own PATH is thinner than a login shell's, so an npm
+ *  that lives under a version manager may not be the one found here; upgrade to
+ *  resolving npm/brew from the CLI's own folder if a mis-install shows up. */
+export async function runEngineUpdate(
+  id: string,
+  binPath: string | null,
+): Promise<{ ok: boolean; command: string | null; error?: string }> {
+  if (!binPath) return { ok: false, command: null, error: `${id} is no longer installed` }
+  const spec = ENGINE_VERSION_SPECS[id]
+  const command = spec ? inferUpdateCommand(spec, binPath) : null
+  if (!command) return { ok: false, command, error: `no update command is known for ${id}` }
+  // The cached "latest" is 6 hours old by design; after an update it would make
+  // the engine read as still behind until it expires.
+  latestCache.delete(id)
+  const [file, ...args] = updateArgv(command, binPath)
+  if (!file) return { ok: false, command, error: `no update command is known for ${id}` }
+  // Through ComSpec on Windows: `npm` is a .cmd shim there, and CreateProcess
+  // cannot start one directly.
+  const out = await spawnCommand(file, args, UPDATE_TIMEOUT_MS, true)
+  if (out.code === 0) return { ok: true, command }
+  const detail = out.combined.split(/\r?\n/).map((line) => line.trim()).filter(Boolean).pop()
+  return { ok: false, command, error: detail || `exit ${out.code ?? 'timeout'}` }
+}

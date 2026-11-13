@@ -1,0 +1,210 @@
+/**
+ * Immutable database-migration ledger understood by this application build.
+ *
+ * Append new entries; never edit or reorder an applied entry. The checksum is
+ * stored in PostgreSQL and compared on every migration run and application
+ * startup, so changing historical SQL fails closed instead of silently
+ * redefining what an old version meant.
+ */
+export interface MigrationMetadata {
+  version: number
+  name: string
+  checksum: string
+}
+
+export interface AppliedMigration extends MigrationMetadata {
+  applied_at?: Date | string
+}
+
+export const SCHEMA_MIGRATIONS = [
+  {
+    version: 1,
+    name: '0001_legacy_baseline',
+    checksum: '5250b63e17bb5a028483b72a799b868418b875e7c0802be4168175b9930aa7d0',
+  },
+  {
+    version: 2,
+    name: '0002_normalized_conversation_members',
+    checksum: '489abe15a28b6c1ee11e7a3e03f79c2949574687333de1d97e7b7eff33c6d2b3',
+  },
+  {
+    version: 3,
+    name: '0003_workspace_cleanup_jobs',
+    checksum: 'cd4047a09fb585ba166e7e0a48a21169168da567728dcb63ae8e6ff5bd204d89',
+  },
+  {
+    version: 4,
+    name: '0004_agent_runtime_assignment',
+    checksum: '59956150df026c36238298603ed47438abf154cfc779034758d7141a79ae00b2',
+  },
+  {
+    version: 5,
+    name: '0005_search_trigram_index',
+    checksum: 'eac389304940a9af260ebc51e13b97f5d0d9d0148460debceaf328d8bbcd76f2',
+  },
+  {
+    version: 6,
+    name: '0006_email_messages_company_smtp_id',
+    checksum: 'a4a37d6d293f4b36eca5471f20ba3a6e5e40d8c15435133843ef9cb28a636331',
+  },
+  {
+    version: 7,
+    name: '0007_engine_defaults',
+    checksum: '1d81ce74821ff467e73feac0d8116520c742775b7ef31badab22480e7c679632',
+  },
+  {
+    version: 8,
+    name: '0008_agent_provider_profile',
+    checksum: '8816423a0ad867d4781c6a9e323e6e34ecadca0ecaf82bd0b9541f164a199fa0',
+  },
+  {
+    version: 9,
+    name: '0009_agent_routing_claims',
+    checksum: '2bf97e295fef3fa7e42cdc476867e89b4d9c976362dfad7e7256bf74308c30fc',
+  },
+  {
+    version: 10,
+    name: '0010_board_card_due_on',
+    checksum: 'd07af706ca94ea26c789f7103d94bf8af00b174034f2fd9b817c8bde3e45560a',
+  },
+  {
+    version: 11,
+    name: '0011_agent_native_fast_mode',
+    checksum: '18ef047d7ee5ad254918f95f8b8320a2c0395401ee7354769763773ebd43ab41',
+  },
+  {
+    version: 12,
+    name: '0012_message_attachments',
+    checksum: 'e33811b25478626ed879c3aad75364daff33922c572eb498c981c8a3d9c95d1d',
+  },
+  {
+    version: 13,
+    name: '0013_attachment_grants',
+    checksum: '7ad86f32412eea99834c28608c97c9fbbf7257c3e93e14896e2754b167908453',
+  },
+  {
+    version: 14,
+    name: '0014_computer_unsandboxed_mode',
+    checksum: 'de9853e347a1ce38025be10d8045be34f2f1ee9570183553c371a49331aee705',
+  },
+  {
+    version: 15,
+    name: '0015_former_agent_deletion',
+    checksum: '9dd5b8ed5f8d39a29521f25f1f1d0dc569e12c4b9eef84c4816deb4570b418d7',
+  },
+  {
+    version: 16,
+    name: '0016_social_memories',
+    checksum: '2a1808f1be016fa9cec9104cbae9ba8459bff88f07685ae454dfcc20c5d9b8ab',
+  },
+  {version:17,name:'0017_runtime_notices',checksum:'5a26527b2454e5f5147de4e807fd4fe064e3644adbe3b6e02df380597d95c87d'},
+] as const satisfies readonly MigrationMetadata[]
+
+/** This build intentionally supports one exact schema range. Expand/contract
+ * releases may widen the range, but both bounds must remain explicit. */
+export const MIN_SUPPORTED_SCHEMA_VERSION = 17
+export const MAX_SUPPORTED_SCHEMA_VERSION = 17
+
+function assertManifestShape(): void {
+  for (let i = 0; i < SCHEMA_MIGRATIONS.length; i++) {
+    const migration = SCHEMA_MIGRATIONS[i]
+    if (migration.version !== i + 1) throw new Error('schema migration versions must be contiguous from 1')
+    if (!/^\d{4}_[a-z0-9_]+$/.test(migration.name)) throw new Error(`invalid migration name: ${migration.name}`)
+    if (!/^[a-f0-9]{64}$/.test(migration.checksum)) throw new Error(`invalid migration checksum: ${migration.name}`)
+  }
+  if (MAX_SUPPORTED_SCHEMA_VERSION !== SCHEMA_MIGRATIONS.at(-1)?.version) {
+    throw new Error('maximum supported schema version must match the manifest tip')
+  }
+  if (MIN_SUPPORTED_SCHEMA_VERSION < 1 || MIN_SUPPORTED_SCHEMA_VERSION > MAX_SUPPORTED_SCHEMA_VERSION) {
+    throw new Error('invalid supported schema version range')
+  }
+}
+
+assertManifestShape()
+
+export class MigrationHistoryError extends Error {
+  readonly code: 'schema_uninitialized' | 'schema_behind' | 'schema_ahead' | 'migration_history_invalid'
+
+  constructor(
+    code: MigrationHistoryError['code'],
+    message: string,
+  ) {
+    super(message)
+    this.name = 'MigrationHistoryError'
+    this.code = code
+  }
+}
+
+export interface MigrationHistoryState {
+  currentVersion: number
+  pending: readonly MigrationMetadata[]
+}
+
+/**
+ * Validate that the persisted ledger is an exact, contiguous prefix of this
+ * build's immutable manifest. Migrators may accept a pending suffix; normal
+ * application startup requires the supported range to already be present.
+ */
+export function validateMigrationHistory(
+  appliedRows: readonly AppliedMigration[],
+  opts: { allowPending?: boolean } = {},
+): MigrationHistoryState {
+  const applied = [...appliedRows].sort((a, b) => a.version - b.version)
+
+  if ((applied.at(-1)?.version ?? 0) > MAX_SUPPORTED_SCHEMA_VERSION) {
+    throw new MigrationHistoryError(
+      'schema_ahead',
+      `database schema version ${applied.at(-1)?.version} is newer than this application supports (${MAX_SUPPORTED_SCHEMA_VERSION})`,
+    )
+  }
+
+  if (applied.length > SCHEMA_MIGRATIONS.length) {
+    throw new MigrationHistoryError(
+      'schema_ahead',
+      `database schema version ${applied.at(-1)?.version ?? 'unknown'} is newer than this application supports (${MAX_SUPPORTED_SCHEMA_VERSION})`,
+    )
+  }
+
+  for (let i = 0; i < applied.length; i++) {
+    const actual = applied[i]
+    const expected = SCHEMA_MIGRATIONS[i]
+    if (!expected || actual.version !== expected.version) {
+      throw new MigrationHistoryError(
+        'migration_history_invalid',
+        `migration history is not a contiguous prefix at position ${i + 1}`,
+      )
+    }
+    if (actual.name !== expected.name || actual.checksum !== expected.checksum) {
+      throw new MigrationHistoryError(
+        'migration_history_invalid',
+        `migration ${actual.version} does not match immutable manifest metadata`,
+      )
+    }
+  }
+
+  const currentVersion = applied.at(-1)?.version ?? 0
+  const pending = SCHEMA_MIGRATIONS.slice(applied.length)
+  if (opts.allowPending) return { currentVersion, pending }
+
+  if (currentVersion === 0) {
+    throw new MigrationHistoryError(
+      'schema_uninitialized',
+      'database schema is uninitialized; run `npm run migrate` before starting the server',
+    )
+  }
+  if (currentVersion < MIN_SUPPORTED_SCHEMA_VERSION) {
+    throw new MigrationHistoryError(
+      'schema_behind',
+      `database schema version ${currentVersion} is behind the supported range ${MIN_SUPPORTED_SCHEMA_VERSION}-${MAX_SUPPORTED_SCHEMA_VERSION}; run ` +
+        '`npm run migrate` before starting the server',
+    )
+  }
+  if (currentVersion > MAX_SUPPORTED_SCHEMA_VERSION) {
+    throw new MigrationHistoryError(
+      'schema_ahead',
+      `database schema version ${currentVersion} is newer than the supported range ${MIN_SUPPORTED_SCHEMA_VERSION}-${MAX_SUPPORTED_SCHEMA_VERSION}`,
+    )
+  }
+
+  return { currentVersion, pending }
+}

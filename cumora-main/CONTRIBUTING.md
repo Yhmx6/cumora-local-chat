@@ -1,0 +1,208 @@
+# Contributing to Cumora
+
+Thanks for your interest in Cumora. This guide covers how to get set up, the
+checks your change needs to pass, and a couple of architecture invariants that
+are enforced in CI so you don't get surprised.
+
+By contributing you agree that your contributions are licensed under the
+project's [MIT License](LICENSE).
+
+## Getting set up
+
+You need **Postgres** and **Redis** running locally. Node floors differ by
+artifact. The root `package.json` `engines` field is `>=20`, which is the
+install floor the production image proves. npm is not run with
+`engine-strict`, so a dependency's own engines field warns instead of
+failing `npm ci`.
+
+| Artifact | Node |
+| --- | --- |
+| Root `engines` | `>=20` |
+| CI typecheck, test, and deploy (`pr.yml`, `build.yml`, `deploy.yml`, `production-readback.yml`) | 24 |
+| `publish.yml` | 20 |
+| `server/docker/cumora-server.Dockerfile`, `server/docker/agent-computer.Dockerfile` | `node:20-bookworm-slim` |
+| `agent-cli/package.json` `engines` | `>=18` |
+| `@capacitor/cli` | `>=22` |
+
+Use Node 22 or newer for local app and mobile work. CI runs Node 24.
+Node 20 can install this tree — the server and agent images do it on every
+build. Node 18 is below the AWS SDK and Capacitor floors. Production images
+still run Node 20 while CI validates Node 24; those are different runtimes.
+
+```bash
+createdb -h localhost cumora
+export OPENAI_API_KEY=sk-...        # the only hard-required env var
+
+npm run setup                     # root + email-gate + r2-gate dependencies
+npm run dev:all                     # Vite renderer on :5180 + API server on :5181
+```
+
+Use `npm run setup` rather than a root-only `npm install`: the root test
+command also runs `workers/email-gate` and `workers/r2-gate` tests, whose
+dependencies live in each worker's `package.json`.
+
+Open http://localhost:5180 for the web app, or `npm run electron:dev` for the
+desktop shell. Database migrations are applied via `npm run migrate` (run
+automatically by `dev:all` and `electron:dev`), and seeded on boot with a starter team. Everything else (OAuth login, email, storage, push, the
+sub2api LLM gateway) soft-disables when its env vars are unset — see
+[`.env.example`](.env.example).
+
+Component-specific setup lives in [`docs/`](docs/): `BYOA.md` (the local-engine
+daemon), `MOBILE_IOS.md`, `PUSH_NOTIFICATIONS.md`, `email.md`, `API.md`,
+`LIMITS.md`, `EGRESS.md`.
+
+## Before you open a PR
+
+Run the same gates CI runs. All of these must pass:
+
+```bash
+npm run lint                   # Biome lint (autofix with `npm run lint:fix`)
+npm run typecheck              # frontend types
+npm run server:typecheck       # server types
+npm test                       # unit tests (node:test) for server + workers + frontend lib
+npm run test:integration       # integration suite, see the env var below
+npm run guard:big-brain        # architecture guard, see below
+npm run guard:llm-tracked      # architecture guard, see below
+npm run guard:engine-registry  # architecture guard, see below
+npm run guard:migration-locks  # schema guard, see below
+```
+
+`npm run test:integration` needs a **dedicated** database and does nothing
+without `INTEGRATION_DATABASE_URL` — it prints `[integration] skipped` and
+exits 0, which looks exactly like a pass. The suite `TRUNCATE`s every table,
+so point it at a throwaway DB:
+
+```bash
+createdb -h localhost cumora_test
+INTEGRATION_DATABASE_URL=postgres://$USER@localhost:5432/cumora_test \
+  npm run test:integration
+```
+
+Biome is configured (`biome.json`) as a **linter only** — it is not a
+formatter here, so it won't reflow existing code. The rule set is a
+pragmatic subset of Biome's recommended rules: correctness and real-bug
+rules are on; noisy or intentional-pattern style rules are off, while the a11y
+rules are enforced incrementally (useButtonType, ARIA roles/props, and core
+accessibility rules are active).
+
+Both TypeScript projects are `strict`. Tests live in five places:
+`tests/` (frontend lib units), `server/src/__integration__` (integration,
+opt-in via the env var above), `server/src/__tests__` (server units),
+`workers/email-gate/src`, and `workers/r2-gate/src`. `npm test` runs all of
+those except integration. The worker glob is `workers/**/*.test.ts`, which
+is why `npm run setup` installs both workers instead of a bare `npm install`.
+
+## Three architecture invariants (enforced in CI)
+
+These aren't style preferences — they're the product's core cost model, and a
+guard script will fail your build if you break them:
+
+1. **Only agent turns may use the big model.** The cheap "cerebellum" model
+   handles triage, classification, summaries, and every other utility call;
+   the expensive model is reserved for the actual agent reasoning turn. If you
+   add an LLM call, route it through the right tier. `npm run guard:big-brain`
+   checks this.
+2. **Every LLM call must be tracked** in the cost ledger. Untracked spend is a
+   correctness bug here, not just an oversight. `npm run guard:llm-tracked`
+   checks this.
+3. **A BYOA engine is wired into all of its registries or none.** A
+   half-wired engine does not error — `normalizeByoaSource()` maps anything
+   unknown to `byoa-claude`, so its runs quietly bill to the wrong engine.
+   `npm run guard:engine-registry` checks this.
+
+## Writing a schema migration
+
+Migrations run from a pre-deploy Job, against production, **while the old Pods
+are still serving traffic**, and `ensureSchema` pins that session at
+`lock_timeout = '5s'`. DDL that needs an `ACCESS EXCLUSIVE` lock on a hot table
+has five seconds to get it before the statement aborts with `55P03`; even when
+it does get the lock, every query behind it waits for the whole statement.
+
+Once a migration has been applied its SQL is checksum-pinned and can never be
+rewritten — so a lock-taking migration cannot be fixed afterwards, only worked
+around. `npm run guard:migration-locks` rejects the two patterns that have cost
+this project production time:
+
+- **`ADD COLUMN … DEFAULT <volatile>`.** PostgreSQL's metadata-only fast path
+  applies only to non-volatile defaults; `gen_random_uuid()`, `random()`,
+  `nextval()` and friends force a full table and index rewrite. Write it as
+  nullable column → batched backfill → `SET DEFAULT` →
+  `CHECK (… IS NOT NULL) NOT VALID` → `VALIDATE CONSTRAINT`. `now()` is
+  `STABLE`, not volatile, and is fine.
+- **`CREATE INDEX` without `CONCURRENTLY` on an existing table.** It blocks
+  writes for the whole build and deadlocks against live writers. Use
+  `CREATE INDEX CONCURRENTLY` with `transactional: false`, as migrations 0005
+  and 0006 do. Indexing a table the same migration creates is fine.
+
+Transactional migrations that still lose a lock race are retried with backoff
+before the Job fails, so a brief contention spike does not need a redeploy.
+
+`verifyRequiredIndexes` runs on every migration Job, including when nothing
+is pending. A name in `REQUIRED_SCHEMA_INDEXES` fails that Job if the index
+is missing or invalid. Several of those indexes are created only from the
+legacy baseline, so adding a name without a migration that builds it on
+databases already past version 1 blocks deploys, and nothing rebuilds it.
+Remove a name from the required list in the same commit that drops the
+index, and remove the name first. Do not drop
+`idx_conversations_members_gin` because an older comment mentioned a
+rollback window.
+
+`MIN_SUPPORTED_SCHEMA_VERSION` and `MAX_SUPPORTED_SCHEMA_VERSION` are both
+the manifest tip. Appending a migration moves the only schema this build
+will boot. The previous image then refuses the new ledger, so
+`kubectl rollout undo` is not a recovery plan for that deploy. See
+[`docs/RELEASE.md`](docs/RELEASE.md).
+
+Copy `server/src/db/migrations/0002-normalized-conversation-members.ts` when
+you add structure: it introduces the new table, names the foreign keys, and
+writes down `ON DELETE`. The checklist next to the files is
+[`server/src/db/migrations/README.md`](server/src/db/migrations/README.md).
+
+## Dependency advisories
+
+CI does not fail on `npm audit`. The deploy and benchmark workflows install
+with `--no-audit`. The repo has no Dependabot, Renovate, or CodeQL config.
+Until a gate exists, this is the process:
+
+- Before adding or upgrading a dependency, run `npm audit --omit=dev` in
+  the package you changed (the root, `agent-cli`, `workers/email-gate`, or
+  `workers/r2-gate`) and read advisories on packages you are introducing
+  or bumping.
+- In the PR, name each high or critical advisory you are not fixing: the
+  package, the advisory id, whether this repo can reach the vulnerable
+  code, who owns the exception, and the date it expires. Ninety days is
+  the default; say why if the window is different.
+- Do not add `--no-audit` or an audit override without that record.
+
+GitHub Actions in the existing workflows are referenced by tag. Changing
+that pin is a separate change; this policy does not require it.
+
+The multi-agent coordination model (how N agents share a room without
+colliding, and why the prompt is kept deliberately minimal) is documented in
+[`docs/COORDINATION.md`](docs/COORDINATION.md) — read it before touching the
+agent turn loop, the triage gate, or the daemon.
+
+## Coding conventions
+
+- Match the style of the file you're editing. The codebase leans on comments
+  that explain *why* — constraints, trade-offs, and the history behind a
+  non-obvious choice — not what the next line does. If your change reverses a
+  decision a comment documents, update the comment.
+- Keep the coordination prompts (`glance-protocol.ts`, the daemon standing
+  prompt) shape-level and minimal. Adding per-scenario examples to fix one
+  observed bug is the most expensive class of change here — see the
+  anti-patterns in `docs/COORDINATION.md`.
+- Prefer `any`-free, well-typed code; both tsconfigs are strict for a reason.
+
+## Reporting bugs and security issues
+
+- **Security vulnerabilities**: do **not** file a public issue — follow
+  [`SECURITY.md`](SECURITY.md).
+- **Bugs and features**: open a GitHub issue with clear reproduction steps and
+  what you expected to happen.
+
+## Commit and PR hygiene
+
+- Write focused commits with a clear message explaining *why*, not just what.
+- Keep a PR to one logical change; smaller PRs get reviewed faster.
+- Make sure the full check list above is green before requesting review.
