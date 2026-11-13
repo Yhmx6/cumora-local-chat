@@ -925,23 +925,16 @@ input:focus, textarea:focus, button:focus { outline: none; }
   text-align: left;
   animation: cumora-reaction-count-in 220ms cubic-bezier(0.22, 1, 0.36, 1) both;
 }
-.reaction-quick-tray {
-  transform: translateY(2px) scale(0.98);
-  transform-origin: left center;
-  transition:
-    opacity 160ms ease,
-    transform 190ms cubic-bezier(0.22, 1, 0.36, 1);
-}
-.group:hover .reaction-quick-tray,
-.group:focus-within .reaction-quick-tray {
-  transform: translateY(0) scale(1);
-}
-.reaction-quick-button {
-  color: var(--ink-500);
-}
-.reaction-quick-button:hover {
-  background: rgb(var(--skype-rgb) / 0.12);
-  box-shadow: 0 8px 18px -16px rgb(var(--skype-deep-rgb) / 0.5);
+@media (hover: hover) and (pointer: fine) {
+  .messenger-reply-button {
+    opacity: 0;
+    pointer-events: none;
+  }
+  .messenger-message:hover .messenger-reply-button,
+  .messenger-message:focus-within .messenger-reply-button {
+    opacity: 1;
+    pointer-events: auto;
+  }
 }
 .reaction-burst {
   position: absolute;
@@ -1012,8 +1005,7 @@ input:focus, textarea:focus, button:focus { outline: none; }
     will-change: auto !important;
   }
 
-  .reaction-control,
-  .reaction-quick-tray {
+  .reaction-control {
     transition: none !important;
     transform: none !important;
   }

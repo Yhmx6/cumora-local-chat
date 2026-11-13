@@ -1683,7 +1683,7 @@ function ReplyIconButton({ msg }: { msg: Message }) {
     <button
       type="button"
       onClick={() => setReplyingTo(msg.conversationId, msg.id)}
-      className="w-6 h-6 rounded-full hover:bg-sky2-50 grid place-items-center text-ink-400 hover:text-skype-deep"
+      className="messenger-reply-button w-6 h-6 shrink-0 rounded-full hover:bg-sky2-50 grid place-items-center text-ink-400 hover:text-skype-deep motion-safe:transition-opacity"
       title={t('chat.reply')}
       aria-label={t('chat.replyToMessage')}
     >
@@ -1735,6 +1735,7 @@ function MessageRowImpl({ msg, author, delay = 0, animate = true }: MessageRowPr
     if (!isMine) openAgentInfo(author.id)
   }
   const alignEnd = split && isMine
+  const reactions = Array.from(new Map((msg.reactions ?? []).map((r) => [r.emoji, r])).values())
 
   const body = (
     <>
@@ -1827,12 +1828,15 @@ function MessageRowImpl({ msg, author, delay = 0, animate = true }: MessageRowPr
           </div>
         )}
 
-        {split ? (
-          <div className={cn('flex items-end gap-1.5 max-w-full', isMine && 'flex-row-reverse')}>
-            <div className="messenger-message-body min-w-0 max-w-[min(100%,580px)]">{body}</div>
-            <span className="shrink-0 text-[10.5px] text-ink-300 tabular-nums leading-none pb-1">{msg.at}</span>
+        <div className={cn('flex items-end gap-1.5 max-w-full', alignEnd && 'flex-row-reverse')}>
+          <div className={cn('min-w-0', split && 'messenger-message-body max-w-[min(100%,580px)]')}>
+            {body}
           </div>
-        ) : body}
+          <div className={cn('flex shrink-0 items-center gap-1', alignEnd && 'flex-row-reverse')}>
+            {split && <span className="text-[10.5px] text-ink-300 tabular-nums leading-none">{msg.at}</span>}
+            <ReplyIconButton msg={msg} />
+          </div>
+        </div>
 
         {(msg.failed || msg.unconfirmed) && (
           <div className="mt-1 flex items-center gap-2 text-[11px] text-coral-deep">
@@ -1865,20 +1869,11 @@ function MessageRowImpl({ msg, author, delay = 0, animate = true }: MessageRowPr
           </button>
         )}
 
-        <div className="messenger-reactions mt-2 flex flex-wrap gap-1 items-center">
-          {/* Dedup by emoji at the render boundary — last writer wins.
-              The store's mergeReactionOrder already keeps the array
-              unique, but a defensive Map here guarantees the pill row
-              never doubles up even if a future code path slips a
-              duplicate through. */}
-          {Array.from(
-            new Map((msg.reactions ?? []).map((r) => [r.emoji, r])).values(),
-          ).map((r) => <ReactionPill key={r.emoji} msgId={msg.id} r={r} />)}
-          {/* Reply button, visible on hover. */}
-          <div className="reaction-quick-tray opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 transition-opacity flex gap-0.5">
-            <ReplyIconButton msg={msg} />
+        {reactions.length > 0 && (
+          <div className="messenger-reactions mt-2 flex flex-wrap gap-1 items-center">
+            {reactions.map((r) => <ReactionPill key={r.emoji} msgId={msg.id} r={r} />)}
           </div>
-        </div>
+        )}
       </div>
     </div>
   )
